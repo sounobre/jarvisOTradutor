@@ -1,0 +1,29 @@
+server:
+  port: 8080
+spring:
+  servlet:
+    multipart:
+      max-file-size: 200MB
+      max-request-size: 200MB
+
+
+# PostgreSQL
+  datasource:
+      url=${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/jarvistradutor}
+      username=${SPRING_DATASOURCE_USERNAME:postgres}
+      password=${SPRING_DATASOURCE_PASSWORD:123456}
+
+  # JPA/Hibernate
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    show-sql: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+app:
+  storageDir: ${STORAGE_DIR:C:/Users/souno/Desktop/Projects2025/jarvistradutor/}
+  workerBaseUrl: ${WORKER_BASE_URL:http://localhost:8000}

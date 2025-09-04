@@ -1,0 +1,46 @@
+# --- Node.js / Frontend ---
+node_modules/
+dist/
+build/
+.npm/
+.pnpm-store/
+.next/
+.expo/
+.expo-shared/
+
+# --- Python / Worker ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.sqlite3
+.venv/
+.env
+.env.*
+*.log
+
+# HuggingFace / cache de modelos
+.cache/
+huggingface/
+*.bin
+
+# --- Java / Backend ---
+target/
+*.class
+*.log
+*.out
+*.war
+*.ear
+
+# --- IDEs ---
+.vscode/
+.idea/
+*.iml
+
+# --- Sistema ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
