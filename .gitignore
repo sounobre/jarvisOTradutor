@@ -1,48 +1,50 @@
-# --- Node.js / Frontend ---
-node_modules/
-dist/
-build/
-.npm/
-.pnpm-store/
-.next/
-.expo/
-.expo-shared/
+# --- Node / Frontend ---
+**/node_modules/
+**/.next/
+**/.nuxt/
+**/.expo/
+**/dist/
+**/build/
+**/.turbo/
+
+# --- Java / Backend ---
+**/target/
+**/.gradle/
+**/.mvn/
+**/out/
 
 # --- Python / Worker ---
-__pycache__/
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
 *.pyc
 *.pyo
 *.pyd
-*.pkl
-*.sqlite3
-.venv/
-.env
-.env.*
-*.log
 
-# HuggingFace / cache de modelos
-.cache/
-huggingface/
-*.bin
-
-# --- Java / Backend ---
-target/
-*.class
-*.log
-*.out
-*.war
-*.ear
-
-# --- IDEs ---
+# --- IDEs / Editors ---
 .vscode/
 .idea/
 *.iml
 
-# --- Sistema ---
+# --- OS ---
 .DS_Store
 Thumbs.db
-*.swp
-*.swo
 
+# --- Env / Config ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# --- Logs / Temp ---
+*.log
+logs/
+tmp/
+temp/
+
+# --- Runtime data ---
+uploads/
+translated/
 **/uploads/
 **/translated/
