@@ -1,109 +1,111 @@
 # worker/services/models.py
 from __future__ import annotations
-from transformers import (
-    MarianMTModel, MarianTokenizer,
-    M2M100ForConditionalGeneration, M2M100Tokenizer,
-    AutoModelForSeq2SeqLM, AutoTokenizer,
-)
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Tuple, Any
+import logging
 
-# cache simples em memória
-_cache: Dict[str, object] = {}
+from transformers import (
+    MarianTokenizer, MarianMTModel,
+    M2M100ForConditionalGeneration, M2M100Tokenizer,
+    AutoTokenizer, AutoModelForSeq2SeqLM,
+)
+
+from ..core.config import settings
+
+logger = logging.getLogger("jarvis-tradutor")
+
+# cache simples se você quiser manter modelo/tokenizer singletons:
+_cache: Dict[str, Any] = {}
+
 
 def load_model(
     model_name: str,
-    src_lang: str = "en",
-    tgt_lang: str = "pt",
-    nllb_src: str = "eng_Latn",
-    nllb_tgt: str = "por_Latn",
+    src_lang: str | None = None,
+    tgt_lang: str | None = None,
+    nllb_src: str | None = None,
+    nllb_tgt: str | None = None,
 ):
     """
-    Retorna (tokenizer, model, prepare_inputs_fn, decode_kwargs) conforme o modelo.
-    - Marian: Helsinki-NLP/opus-...
-    - M2M100: facebook/m2m100_418M
-    - NLLB: facebook/nllb-200-xxx
+    Carrega modelo + tokenizer conforme o tipo.
+    Retorna (tokenizer, model, prepare_inputs(batch)->(enc, gen_extra), decode_kwargs).
     """
-    # já em cache?
-    if _cache.get("name") == model_name:
-        return (
-            _cache["tok"],
-            _cache["model"],
-            _cache["prepare"],
-            _cache["decode"],
-        )
+    logger.info(
+        "Carregando modelo: %s | src_lang=%s tgt_lang=%s nllb_src=%s nllb_tgt=%s",
+        model_name, src_lang, tgt_lang, nllb_src, nllb_tgt
+    )
 
-    # ----- M2M100 -----
-    if "m2m100" in model_name.lower():
-        tok = M2M100Tokenizer.from_pretrained(model_name)
-        model = M2M100ForConditionalGeneration.from_pretrained(model_name)
+    name = model_name.lower()
 
-        def prepare(batch):
-            # seta idioma de origem e BOS do alvo
-            tok.src_lang = src_lang
-            enc = tok(batch, return_tensors="pt", padding=True, truncation=True)
-            forced_bos = tok.get_lang_id(tgt_lang)
-            extra = {"forced_bos_token_id": forced_bos}
-            return enc, extra
-
-        decode = {
-            "skip_special_tokens": True,
-            "clean_up_tokenization_spaces": False,  # deixamos o pós-processo cuidar
-        }
-
-    # ----- NLLB-200 -----
-    elif "nllb" in model_name.lower():
-        tok = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
-
-        def prepare(batch):
-            enc = tok(batch, return_tensors="pt", padding=True, truncation=True)
-            forced_bos = tok.lang_code_to_id[nllb_tgt]
-            extra = {"forced_bos_token_id": forced_bos}
-            return enc, extra
-
-        decode = {
-            "skip_special_tokens": True,
-            "clean_up_tokenization_spaces": False,
-        }
-
-    # ----- Marian (default) -----
-    else:
+    # ---- Marian (Helsinki-NLP/opus-mt-*) ----
+    if "marian" in name or "opus-mt" in name:
         tok = MarianTokenizer.from_pretrained(model_name)
         model = MarianMTModel.from_pretrained(model_name)
 
-        def prepare(batch):
+        def prepare_inputs(batch):
             enc = tok(batch, return_tensors="pt", padding=True, truncation=True)
-            extra = {}
-            return enc, extra
+            gen_extra = {}
+            return enc, gen_extra
 
-        decode = {
-            "skip_special_tokens": True,
-            "clean_up_tokenization_spaces": True,  # Marian lida bem; pode ajustar depois
-        }
+        decode_kwargs = dict(skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
-    _cache["name"] = model_name
-    _cache["tok"] = tok
-    _cache["model"] = model
-    _cache["prepare"] = prepare
-    _cache["decode"] = decode
-    return tok, model, prepare, decode
+    # ---- M2M100 (facebook/m2m100_*) ----
+    elif "m2m100" in name:
+        tok = M2M100Tokenizer.from_pretrained(model_name)
+        model = M2M100ForConditionalGeneration.from_pretrained(model_name)
 
-# worker/services/models.py
-from worker.core.config import settings
+        if not src_lang or not tgt_lang:
+            raise ValueError("M2M100 requer SRC_LANG e TGT_LANG definidos.")
 
+        def prepare_inputs(batch):
+            enc = tok(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                src_lang=src_lang,  # obrigatório
+            )
+            gen_extra = {"forced_bos_token_id": tok.get_lang_id(tgt_lang)}
+            return enc, gen_extra
+
+        decode_kwargs = dict(skip_special_tokens=True)
+
+    # ---- NLLB (facebook/nllb-200-*) ----
+    elif "nllb" in name or "facebook/nllb-200" in name:
+        tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+        if not nllb_src or not nllb_tgt:
+            raise ValueError("NLLB requer NLLB_SRC e NLLB_TGT definidos.")
+
+        def prepare_inputs(batch):
+            enc = tok(
+                batch,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                src_lang=nllb_src,  # obrigatório
+            )
+            gen_extra = {"forced_bos_token_id": tok.convert_tokens_to_ids(nllb_tgt)}
+            return enc, gen_extra
+
+        decode_kwargs = dict(skip_special_tokens=True)
+
+    else:
+        raise ValueError(f"Modelo não suportado: {model_name}")
+
+    logger.info("Modelo carregado: %s", model_name)
+    return tok, model, prepare_inputs, decode_kwargs
 
 
 def get_model():
     """
-    Retorna (tok, model, prepare_inputs, decode_kwargs) do cache.
-    Se ainda não houver cache, carrega usando Settings.
+    Compat: retorna (tok, model) para código antigo.
+    Para M2M/NLLB passamos também as línguas do settings.
     """
-    if _cache.get("tok") is None or _cache.get("model") is None:
-        return load_model(
-            settings.model_name,
-            settings.src_lang,
-            settings.tgt_lang,
-            settings.nllb_src,
-            settings.nllb_tgt,
-        )
-    return _cache["tok"], _cache["model"], _cache["prepare"], _cache["decode"]
+    tok, model, _, _ = load_model(
+        settings.model_name,
+        src_lang=settings.src_lang,
+        tgt_lang=settings.tgt_lang,
+        nllb_src=settings.nllb_src,
+        nllb_tgt=settings.nllb_tgt,
+    )
+    return tok, model
