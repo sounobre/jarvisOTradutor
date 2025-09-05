@@ -1,8 +1,20 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
+# --- Core FastAPI/ASGI ---
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+
+# --- NLP / Tradução ---
 transformers==4.44.2
-sentencepiece==0.2.0
-pysbd==0.3.4
+torch>=2.3.0
+sentencepiece  # requerido pelos modelos Marian
+sacremoses     # recomendado para tokenização mais precisa
+
+# --- EPUB / Parsing ---
 ebooklib==0.18
 beautifulsoup4==4.12.3
-python-multipart==0.0.9
+lxml==5.3.0
+pysbd==0.3.4
+
+# --- Utils ---
+python-multipart  # upload de arquivos no FastAPI
+pydantic==2.8.2   # já vem com FastAPI, mas explicitado
+pydantic-settings==2.4.0
