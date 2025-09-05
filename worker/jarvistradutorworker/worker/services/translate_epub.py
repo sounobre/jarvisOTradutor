@@ -5,8 +5,9 @@ from bs4 import BeautifulSoup, NavigableString
 from ..core.config import settings
 from ..nlp.loader import load_model
 import pysbd
-import logging, os, tempfile, shutil, re
-from typing import Iterable, List
+import logging, os, tempfile, shutil, re, csv
+from typing import Iterable, List, Dict, Any
+from worker.quality.inspector import QualityInspector, QualityThresholds
 
 logger = logging.getLogger("jarvis-tradutor")
 
@@ -21,6 +22,10 @@ _cache: dict[str, str] = {}
 _tok = _model = _prepare_inputs = _decode_kwargs = None
 
 def get_model_bundle():
+    """
+    Carrega/lazy-cacheia (tokenizer, model, prepare_inputs, decode_kwargs)
+    via o loader que entende Marian / M2M100 / NLLB.
+    """
     global _tok, _model, _prepare_inputs, _decode_kwargs
     if _tok is None:
         _tok, _model, _prepare_inputs, _decode_kwargs = load_model(
@@ -174,6 +179,29 @@ def translate_epub(
         out_dir = os.path.dirname(os.path.abspath(dst_path))
         os.makedirs(out_dir, exist_ok=True)
 
+        # carrega / prepara modelo e inspector
+        tok_m, model_m, prepare_inputs, decode_kwargs = get_model_bundle()
+        inspector = QualityInspector(
+            thresholds=QualityThresholds(
+                min_len_ratio=0.6,
+                max_len_ratio=1.6,
+                max_untranslated_hits=2,
+                max_punct_issues=3,
+                min_semantic_sim=0.68,
+                min_avg_logprob=-2.5,
+            ),
+            enable_semantic=True,             # desliga se não quiser embeddings
+            tokenizer=tok_m,
+            model=model_m,
+            prepare_inputs=prepare_inputs,
+            decode_kwargs=decode_kwargs,
+            src_lang=settings.src_lang,
+            tgt_lang=settings.tgt_lang,
+        )
+
+        # CSV de métricas por parágrafo (opcional)
+        quality_rows: List[Dict[str, Any]] = []
+
         book = epub.read_epub(src_path)
         logger.info("Arquivo EPUB carregado.")
 
@@ -199,7 +227,29 @@ def translate_epub(
                 if not sents:
                     continue
                 translated_sents = translate_segments(sents)
-                node.replace_with(" ".join(translated_sents))
+                pt_text = " ".join(translated_sents)
+                node.replace_with(pt_text)
+
+                # --- Quality Inspector: avalia e loga ---
+                metrics = inspector.analyze_paragraph(original, pt_text)
+                # guarda resumão para CSV (opcional)
+                quality_rows.append({
+                    "doc_id": item.get_id(),
+                    "file_name": item.file_name or "",
+                    "orig_len": len(original),
+                    "pt_len": len(pt_text),
+                    "length_ratio": f"{metrics.get('length_ratio', 0):.3f}",
+                    "untranslated_hits": metrics.get("untranslated_hits"),
+                    "punct_issues": metrics.get("punct_issues"),
+                    "semantic_sim": (None if metrics.get("semantic_sim") is None else f"{metrics['semantic_sim']:.3f}"),
+                    "avg_logprob": (None if metrics.get("avg_logprob") is None else f"{metrics['avg_logprob']:.3f}"),
+                    "lang_detect": metrics.get("lang_detect"),
+                    "needs_review": metrics.get("needs_review"),
+                    "reasons": ";".join(metrics.get("reasons", [])),
+                    # pequenos trechos pra inspecionar (evita CSV gigante)
+                    "orig_snippet": (original[:120] + "…") if len(original) > 120 else original,
+                    "pt_snippet": (pt_text[:120] + "…") if len(pt_text) > 120 else pt_text,
+                })
 
             item.set_content(str(soup).encode("utf-8"))
 
@@ -215,7 +265,6 @@ def translate_epub(
                 if isinstance(it, epub.Link):
                     hrefs.append(it.href)
                 elif isinstance(it, epub.Section):
-                    # por via das dúvidas, planifica só para log
                     for sub in it:
                         if isinstance(sub, epub.Link):
                             hrefs.append(sub.href)
@@ -231,6 +280,18 @@ def translate_epub(
         shutil.move(tmp_path, dst_path)
         logger.info("Tradução concluída. Arquivo salvo em: %s (%d bytes)", dst_path, size)
 
+        # ---- escreve CSV com métricas (opcional; comente se não quiser) ----
+        try:
+            csv_path = dst_path + ".quality.csv"
+            with open(csv_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(quality_rows[0].keys()) if quality_rows else [])
+                if quality_rows:
+                    writer.writeheader()
+                    writer.writerows(quality_rows)
+            logger.info("Relatório de qualidade salvo em: %s (linhas=%d)", csv_path, len(quality_rows))
+        except Exception:
+            logger.exception("Falha ao salvar CSV de qualidade (opcional).")
+
     except Exception:
         logger.exception("Falha durante a tradução/salvamento do EPUB")
         raise
@@ -239,4 +300,3 @@ def translate_epub(
 def translate_epub_file(src_path: str, dst_path: str) -> None:
     """Wrapper simples para o routes.py"""
     translate_epub(src_path, dst_path)
-
