@@ -3,15 +3,14 @@ server:
 spring:
   servlet:
     multipart:
-      max-file-size: 200MB
-      max-request-size: 200MB
+      max-file-size: 200000MB
+      max-request-size: 200000MB
 
-
-# PostgreSQL
+  # PostgreSQL
   datasource:
-      url=${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/jarvistradutor}
-      username=${SPRING_DATASOURCE_USERNAME:postgres}
-      password=${SPRING_DATASOURCE_PASSWORD:123456}
+      url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/jarvistradutor}
+      username: ${SPRING_DATASOURCE_USERNAME:postgres}
+      password: ${SPRING_DATASOURCE_PASSWORD:123456}
 
   # JPA/Hibernate
   jpa:
@@ -23,7 +22,23 @@ spring:
       hibernate:
         jdbc:
           time_zone: UTC
+          show_sql: false
+          format_sql: false
+  http:
+    codecs:
+      max-in-memory-size: 64MB
 
 app:
   storageDir: ${STORAGE_DIR:C:/Users/souno/Desktop/Projects2025/jarvistradutor/}
   workerBaseUrl: ${WORKER_BASE_URL:http://localhost:8000}
+
+
+# URL do Worker Python que retorna embeddings (um endpoint simples tipo /embed)
+jarvis:
+  embeddings:
+    base-url: http://localhost:8001                      # FastAPI do worker
+    model: paraphrase-multilingual-MiniLM-L12-v2         # só informativo aqui
+  tm:
+    cosine-threshold: 0.86                               # limiar de aceitação
+    ratio-min: 0.5                                       # filtros de qualidade para import
+    ratio-max: 2.0
