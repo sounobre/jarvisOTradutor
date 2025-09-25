@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.postgresql.copy.CopyManager;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -23,7 +24,7 @@ import java.sql.Connection;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
-import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.web.reactive.function.client.ExchangeStrategies;
 
 @Slf4j
 @Service
@@ -33,11 +34,15 @@ public class TMImportServiceImpl implements TMImportService {
     private final TextNormalizer norm;
     private final DataSource dataSource;
     private final ImportCheckpointRepository checkpointRepo;
-    private final JdbcTemplate jdbc; // para DDL/merge rápidos
+    private final JdbcTemplate jdbc; // DDL/merge
 
-    // Embeddings API client (ajuste host/porta se necessário)
     private final WebClient embClient = WebClient.builder()
             .baseUrl("http://localhost:8001")
+            .exchangeStrategies(
+                    ExchangeStrategies.builder()
+                            .codecs(c -> c.defaultCodecs().maxInMemorySize(64 * 1024 * 1024)) // 64 MB
+                            .build()
+            )
             .build();
 
     @Value("${jarvis.tm.ratio-min:0.5}")
@@ -45,18 +50,18 @@ public class TMImportServiceImpl implements TMImportService {
     @Value("${jarvis.tm.ratio-max:2.0}")
     private double ratioMax;
 
-    // ------------------------------------------------------------------------------------
-    // Upload normal (multipart) — streaming -> COPY (sem arquivo temporário)
-    // ------------------------------------------------------------------------------------
+    // ===================== Upload (multipart) -> COPY (tm_staging) =====================
+
     @Override
     public long importTsvOrCsvStreaming(MultipartFile file, String delimiter) throws Exception {
+        ensureTmStagingSchema();
+
         final String delim = normalizeDelimiter(delimiter);
         log.info("Import upload iniciado: filename='{}', delimiter='{}'",
                 file.getOriginalFilename(), printableDelim(delim));
 
         long rows = 0, seen = 0;
 
-        // Conexão + COPY + pipe
         Connection con = DataSourceUtils.getConnection(dataSource);
         final CopyManager cm = con.unwrap(org.postgresql.PGConnection.class).getCopyAPI();
         final PipedReader pr = new PipedReader(1 << 16);
@@ -65,12 +70,12 @@ public class TMImportServiceImpl implements TMImportService {
         final AtomicReference<Throwable> copyErr = new AtomicReference<>();
         Thread copyThread = new Thread(() -> {
             try (Reader r = pr) {
-                cm.copyIn("COPY tm(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)", r);
+                cm.copyIn("COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)", r);
             } catch (Throwable t) {
                 copyErr.set(t);
-                log.error("Erro na thread do COPY (upload)", t);
+                log.error("Erro no COPY (upload)", t);
             }
-        }, "copy-upload");
+        }, "copy-upload-staging");
         copyThread.start();
 
         BufferedReader br = null;
@@ -82,6 +87,9 @@ public class TMImportServiceImpl implements TMImportService {
             out.write("src,tgt,lang_src,lang_tgt,quality\n");
 
             String line;
+            // dedupe leve do lote
+            Set<String> seenKeys = new HashSet<>(1 << 14);
+
             while ((line = br.readLine()) != null) {
                 seen++;
                 String[] cols = line.split(delim, -1);
@@ -98,7 +106,10 @@ public class TMImportServiceImpl implements TMImportService {
                 String langSrc = (cols.length > 2 && !cols[2].isBlank()) ? cols[2] : "en";
                 String langTgt = (cols.length > 3 && !cols[3].isBlank()) ? cols[3] : "pt";
 
-                double q = qualityScore(r, /* placeholders ok */ true);
+                String key = src + "\u0001" + tgt + "\u0001" + langSrc + "\u0001" + langTgt;
+                if (!seenKeys.add(key)) continue;
+
+                double q = qualityScore(r, true);
                 writeCsvLine(out, src, tgt, langSrc, langTgt, String.valueOf(q));
                 rows++;
 
@@ -120,21 +131,26 @@ public class TMImportServiceImpl implements TMImportService {
 
         if (copyErr.get() != null) throw new RuntimeException("COPY (upload) falhou", copyErr.get());
 
+        // Consolidar staging -> tm
+        int up = upsertFromTmStagingToTm();
+        log.info("[upload] staging→tm upserts/updates={}", up);
+        truncateTmStaging();
+
         log.info("Import upload finalizado: lidas={} válidas={}", seen, rows);
         return rows;
     }
 
-    // ------------------------------------------------------------------------------------
-    // Resumível (checkpoint por byte offset) — lê arquivo do disco do servidor em lotes
-    // ------------------------------------------------------------------------------------
+    // ===================== Resumível (arquivo no disco) =====================
+
     @Override
     public ResumeResult importTxtResume(String path, String delimiter, String fileKey, int batchLines,
                                         int examples, String embed) throws Exception {
+        ensureTmStagingSchema();
+
         final String delim = normalizeDelimiter(delimiter);
         final String embedMode = (embed == null ? "none" : embed.toLowerCase(Locale.ROOT)); // none|src|both
         final int EMB_BATCH = 512;
 
-        // carrega/cria checkpoint
         ImportCheckpoint ck = checkpointRepo.findById(fileKey)
                 .orElseGet(() -> ImportCheckpoint.builder()
                         .fileKey(fileKey).path(path).byteOffset(0L).lineCount(0L).build());
@@ -156,7 +172,6 @@ public class TMImportServiceImpl implements TMImportService {
         long processedLines = 0L;
         long totalCopied = 0L;
 
-        // Conexão/COPY/pipe TM
         Connection con = DataSourceUtils.getConnection(dataSource);
         final CopyManager cm = con.unwrap(org.postgresql.PGConnection.class).getCopyAPI();
         final PipedReader pr = new PipedReader(1 << 16);
@@ -165,28 +180,28 @@ public class TMImportServiceImpl implements TMImportService {
 
         Thread copyThread = new Thread(() -> {
             try (Reader r = pr) {
-                cm.copyIn("COPY tm(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)", r);
+                cm.copyIn("COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)", r);
             } catch (Throwable t) {
                 copyErr.set(t);
-                log.error("Erro na thread do COPY (resume)", t);
+                log.error("Erro no COPY (resume->staging)", t);
             }
-        }, "copy-resume");
+        }, "copy-resume-staging");
         copyThread.start();
 
-        // 2º COPY opcional: staging de embeddings
+        // embeddings staging opcional
         final boolean doEmb = !"none".equals(embedMode);
         PipedReader prEmb;
         PipedWriter pwEmb = null;
         BufferedWriter outEmb = null;
         Thread copyEmbThread = null;
         final AtomicReference<Throwable> copyEmbErr = new AtomicReference<>();
-
         if (doEmb) {
             ensureEmbeddingsSchema();
             prEmb = new PipedReader(1 << 16);
             pwEmb = new PipedWriter(prEmb);
             outEmb = new BufferedWriter(pwEmb, 1 << 16);
 
+            // Inicia o COPY do staging de embeddings ANTES de escrever
             copyEmbThread = new Thread(() -> {
                 try (Reader r = prEmb) {
                     cm.copyIn("""
@@ -195,11 +210,12 @@ public class TMImportServiceImpl implements TMImportService {
                     """, r);
                 } catch (Throwable t) {
                     copyEmbErr.set(t);
-                    log.error("Erro na thread do COPY (emb_staging)", t);
+                    log.error("Erro COPY (emb_staging)", t);
                 }
             }, "copy-resume-emb");
             copyEmbThread.start();
 
+            // escreve header do CSV para o COPY
             outEmb.write("src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality\n");
         } else {
             prEmb = null;
@@ -209,16 +225,17 @@ public class TMImportServiceImpl implements TMImportService {
         BufferedWriter out = null;
         long newOffset;
 
-        // examples (até 50)
         final int maxExamples = Math.min(Math.max(0, examples), 50);
         final List<ExamplePair> examplesList = new ArrayList<>(maxExamples);
 
-        // buffers para embeddings (somente pares ACEITOS)
         final List<String> bufSrc = new ArrayList<>(EMB_BATCH);
         final List<String> bufTgt = new ArrayList<>(EMB_BATCH);
         final List<String> bufLangSrc = new ArrayList<>(EMB_BATCH);
         final List<String> bufLangTgt = new ArrayList<>(EMB_BATCH);
         final List<Double> bufQ = new ArrayList<>(EMB_BATCH);
+
+        // dedupe leve por par no lote
+        Set<String> seen = new HashSet<>(batchLines * 2);
 
         try {
             raf = new RandomAccessFile(f, "r");
@@ -234,12 +251,17 @@ public class TMImportServiceImpl implements TMImportService {
                 try { copyThread.join(120_000); } catch (InterruptedException ignore) {}
                 DataSourceUtils.releaseConnection(con, dataSource);
 
-                // também fechar emb_staging se aberto
                 if (doEmb && outEmb != null) {
                     try { outEmb.flush(); } catch (IOException ignore) {}
                     try { outEmb.close(); } catch (IOException ignore) {}
                     try { copyEmbThread.join(120_000); } catch (InterruptedException ignore) {}
                 }
+
+                // consolidar (idempotente)
+                int up = upsertFromTmStagingToTm();
+                log.info("[resume] staging→tm upserts/updates (EOF caso offset>=size) = {}", up);
+                truncateTmStaging();
+                if (doEmb) consolidateEmbeddingsFromStaging();
 
                 return new ResumeResult(0, startOffset, 0, List.of());
             }
@@ -250,7 +272,7 @@ public class TMImportServiceImpl implements TMImportService {
             int linesThisBatch = 0;
             while (true) {
                 String line = readLineUtf8(raf);
-                if (line == null) break; // EOF
+                if (line == null) break;
 
                 processedLines++;
                 linesThisBatch++;
@@ -265,27 +287,28 @@ public class TMImportServiceImpl implements TMImportService {
                         if (r >= ratioMin && r <= ratioMax && ph) {
                             String langSrc = (cols.length > 2 && !cols[2].isBlank()) ? cols[2] : "en";
                             String langTgt = (cols.length > 3 && !cols[3].isBlank()) ? cols[3] : "pt";
-                            double q = qualityScore(r, ph);
+                            String key = src + "\u0001" + tgt + "\u0001" + langSrc + "\u0001" + langTgt;
+                            if (!seen.add(key)) {
+                                // duplicata neste lote
+                            } else {
+                                double q = qualityScore(r, ph);
+                                writeCsvLine(out, src, tgt, langSrc, langTgt, String.valueOf(q));
+                                totalCopied++;
 
-                            // escreve em tm
-                            writeCsvLine(out, src, tgt, langSrc, langTgt, String.valueOf(q));
-                            totalCopied++;
+                                if (examplesList.size() < maxExamples) {
+                                    examplesList.add(new ExamplePair(src, tgt, q));
+                                }
 
-                            // examples
-                            if (examplesList.size() < maxExamples) {
-                                examplesList.add(new ExamplePair(src, tgt, q));
-                            }
+                                if (doEmb) {
+                                    bufSrc.add(src);
+                                    bufTgt.add(tgt);
+                                    bufLangSrc.add(langSrc);
+                                    bufLangTgt.add(langTgt);
+                                    bufQ.add(q);
 
-                            // buffer embeddings
-                            if (doEmb) {
-                                bufSrc.add(src);
-                                bufTgt.add(tgt);
-                                bufLangSrc.add(langSrc);
-                                bufLangTgt.add(langTgt);
-                                bufQ.add(q);
-
-                                if (bufSrc.size() >= EMB_BATCH) {
-                                    flushEmbeddingsBuffer(outEmb, bufSrc, bufTgt, bufLangSrc, bufLangTgt, bufQ, embedMode);
+                                    if (bufSrc.size() >= EMB_BATCH) {
+                                        flushEmbeddingsBuffer(outEmb, bufSrc, bufTgt, bufLangSrc, bufLangTgt, bufQ, embedMode);
+                                    }
                                 }
                             }
                         }
@@ -299,33 +322,28 @@ public class TMImportServiceImpl implements TMImportService {
                 }
 
                 if (linesThisBatch >= batchLines) {
-                    break; // encerra o lote
+                    break;
                 }
             }
 
-            // offset após a última linha lida neste lote
             newOffset = raf.getFilePointer();
 
-            // flushes finais
             out.flush();
             if (doEmb && !bufSrc.isEmpty()) {
+                // apenas flush lógico do último lote; NÃO dar flush do pipe aqui
                 flushEmbeddingsBuffer(outEmb, bufSrc, bufTgt, bufLangSrc, bufLangTgt, bufQ, embedMode);
             }
-            if (doEmb) {
-                outEmb.flush();
-            }
+            // ⚠️ REMOVIDO: outEmb.flush() aqui pode bloquear o pipe se o COPY não drenou.
+            // O fechamento no finally sinaliza EOF de forma segura.
+
         } finally {
-            // encerra TM
-            if (out != null) {
-                try { out.close(); } catch (IOException e) {
-                    log.debug("Ignorando IOException ao fechar 'out' (resume): {}", e.toString());
-                }
-            }
+            // Fecha writer de TM → sinaliza EOF ao COPY e só então faz join.
+            if (out != null) { try { out.close(); } catch (IOException e) { log.debug("Ignorando close(out): {}", e.toString()); } }
             try { copyThread.join(120_000); } catch (InterruptedException ignore) {}
             DataSourceUtils.releaseConnection(con, dataSource);
             if (raf != null) try { raf.close(); } catch (IOException ignore) {}
 
-            // encerra staging
+            // Para embeddings: feche o writer (EOF) antes do join da thread COPY.
             if (doEmb && outEmb != null) {
                 try { outEmb.close(); } catch (IOException ignore) {}
                 if (copyEmbThread != null) {
@@ -334,46 +352,49 @@ public class TMImportServiceImpl implements TMImportService {
             }
         }
 
-
-
         if (copyErr.get() != null) throw new RuntimeException("COPY (resume) falhou", copyErr.get());
         if (doEmb && copyEmbErr.get() != null) throw new RuntimeException("COPY (emb_staging) falhou", copyEmbErr.get());
 
+        // Consolidar staging → tm
+        int up = upsertFromTmStagingToTm();
+        log.info("[resume] staging→tm upserts/updates={}", up);
+        truncateTmStaging();
+
+        // Consolidar embeddings
         if (!"none".equals(embedMode)) {
             int merged = consolidateEmbeddingsFromStaging();
-            log.info("Embeddings consolidados do staging → tm_embeddings: merged={} (upserts)", merged);
+            log.info("Embeddings consolidados do staging → tm_embeddings: {}", merged);
         }
 
-        // Persistência do checkpoint — fora do ciclo do COPY (outra conexão do pool)
+        // salvar checkpoint
         ck.setByteOffset(newOffset);
         ck.setLineCount(ck.getLineCount() + processedLines);
         ck.setPath(path);
         ck.setUpdatedAt(LocalDateTime.now());
-
         checkpointRepo.save(ck);
+
         log.info("Checkpoint salvo: key='{}' offset={} addLines={} copiedThisBatch={}",
                 fileKey, newOffset, processedLines, totalCopied);
-
         log.info("Import resume finalizado: fileKey='{}' processedLines={} totalCopied={} newOffset={}",
                 fileKey, processedLines, totalCopied, newOffset);
 
         return new ResumeResult(processedLines, ck.getByteOffset(), totalCopied, examplesList);
     }
 
-    // ------------------------------------------------------------------------------------
-    // Consultas de checkpoint
-    // ------------------------------------------------------------------------------------
+    // ===================== Checkpoint utils =====================
+
     @Override
     public CheckpointDTO getCheckpoint(String fileKey) {
-        Optional<ImportCheckpoint> opt = checkpointRepo.findById(fileKey);
-        if (opt.isEmpty()) return null;
-        ImportCheckpoint ck = opt.get();
-        Long fileSize = null;
-        try {
-            File f = new File(ck.getPath());
-            if (f.exists()) fileSize = f.length();
-        } catch (Exception ignore) {}
-        return new CheckpointDTO(ck.getFileKey(), ck.getPath(), ck.getByteOffset(), ck.getLineCount(), fileSize);
+        return checkpointRepo.findById(fileKey)
+                .map(ck -> {
+                    Long fileSize = null;
+                    try {
+                        File f = new File(ck.getPath());
+                        if (f.exists()) fileSize = f.length();
+                    } catch (Exception ignore) {}
+                    return new CheckpointDTO(ck.getFileKey(), ck.getPath(), ck.getByteOffset(), ck.getLineCount(), fileSize);
+                })
+                .orElse(null);
     }
 
     @Override
@@ -382,27 +403,24 @@ public class TMImportServiceImpl implements TMImportService {
         log.warn("Checkpoint resetado para fileKey='{}'", fileKey);
     }
 
-    // ------------------------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------------------------
+    // ===================== Helpers comuns =====================
 
-    // lê uma linha em UTF-8 a partir do RandomAccessFile (respeita LF e CRLF)
     private static String readLineUtf8(RandomAccessFile raf) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream(256);
         int b;
         boolean seen = false;
         while ((b = raf.read()) != -1) {
             seen = true;
-            if (b == '\n') break;                 // LF
-            if (b == '\r') {                      // CR (possível CRLF)
+            if (b == '\n') break;
+            if (b == '\r') {
                 long pos = raf.getFilePointer();
                 int next = raf.read();
-                if (next != '\n') raf.seek(pos);  // não era CRLF → volta 1 byte
+                if (next != '\n') raf.seek(pos);
                 break;
             }
             baos.write(b);
         }
-        if (!seen && b == -1) return null;        // EOF sem bytes
+        if (!seen && b == -1) return null;
         return new String(baos.toByteArray(), StandardCharsets.UTF_8);
     }
 
@@ -415,9 +433,7 @@ public class TMImportServiceImpl implements TMImportService {
         out.write('\n');
     }
 
-    private static String esc(String s) {
-        return s.replace("\"", "\"\"");
-    }
+    private static String esc(String s) { return s.replace("\"", "\"\""); }
 
     private static String normalizeDelimiter(String delimiter) {
         if (delimiter == null) return "\t";
@@ -427,23 +443,15 @@ public class TMImportServiceImpl implements TMImportService {
         return d;
     }
 
-    private static String printableDelim(String d) {
-        return "\t".equals(d) ? "\\t" : d;
-    }
+    private static String printableDelim(String d) { return "\t".equals(d) ? "\\t" : d; }
 
-    private static String percent(long a, long b) {
-        return (b == 0) ? "0" : String.format("%.1f", (100.0 * a / b));
-    }
+    private static String percent(long a, long b) { return (b == 0) ? "0" : String.format("%.1f", (100.0 * a / b)); }
 
     private double qualityScore(double r, boolean placeholdersOk) {
         double rs;
-        if (r <= ratioMin || r >= ratioMax) {
-            rs = 0.0;
-        } else if (r <= 1.0) {
-            rs = 1.0 - ((1.0 - r) / (1.0 - ratioMin));
-        } else {
-            rs = 1.0 - ((r - 1.0) / (ratioMax - 1.0));
-        }
+        if (r <= ratioMin || r >= ratioMax) rs = 0.0;
+        else if (r <= 1.0) rs = 1.0 - ((1.0 - r) / (1.0 - ratioMin));
+        else rs = 1.0 - ((r - 1.0) / (ratioMax - 1.0));
         rs = Math.max(0.0, Math.min(1.0, rs));
         double ps = placeholdersOk ? 1.0 : 0.0;
         double q = 0.7 * rs + 0.3 * ps;
@@ -452,7 +460,6 @@ public class TMImportServiceImpl implements TMImportService {
 
     // ========= Embeddings helpers =========
 
-    // chama /embed com lista de textos; retorna lista de vetores (double[])
     private List<double[]> embedTexts(List<String> texts, boolean normalize) {
         if (texts.isEmpty()) return List.of();
         var payload = Map.of("texts", texts, "normalize", normalize);
@@ -467,7 +474,6 @@ public class TMImportServiceImpl implements TMImportService {
                 : List.of();
     }
 
-    // serializa vetor em literal pgvector: "[0.1,0.2,...]"
     private static String toVectorLiteral(double[] v) {
         StringBuilder sb = new StringBuilder();
         sb.append('[');
@@ -479,7 +485,6 @@ public class TMImportServiceImpl implements TMImportService {
         return sb.toString();
     }
 
-    // flush do buffer de embeddings para o COPY de tm_emb_staging
     private void flushEmbeddingsBuffer(Writer outEmb,
                                        List<String> bufSrc,
                                        List<String> bufTgt,
@@ -488,9 +493,7 @@ public class TMImportServiceImpl implements TMImportService {
                                        List<Double> bufQ,
                                        String embedMode) throws IOException {
 
-        // sempre embeda src
         List<double[]> vecSrc = embedTexts(bufSrc, true);
-        // embeda tgt se solicitado
         List<double[]> vecTgt = "both".equals(embedMode) ? embedTexts(bufTgt, true) : List.of();
 
         for (int i = 0; i < bufSrc.size(); i++) {
@@ -503,7 +506,6 @@ public class TMImportServiceImpl implements TMImportService {
             String embSrc = vecSrc.isEmpty() ? "" : toVectorLiteral(vecSrc.get(i));
             String embTgt = (!vecTgt.isEmpty()) ? toVectorLiteral(vecTgt.get(i)) : "";
 
-            // CSV (aspas nos textos; emb_* entre aspas pq têm vírgulas internas)
             outEmb.write('"'); outEmb.write(esc(src)); outEmb.write('"'); outEmb.write(',');
             outEmb.write('"'); outEmb.write(esc(tgt)); outEmb.write('"'); outEmb.write(',');
             outEmb.write('"'); outEmb.write(esc(ls));  outEmb.write('"'); outEmb.write(',');
@@ -516,17 +518,65 @@ public class TMImportServiceImpl implements TMImportService {
             outEmb.write('\n');
         }
 
-        // limpa buffers
-        bufSrc.clear();
-        bufTgt.clear();
-        bufLangSrc.clear();
-        bufLangTgt.clear();
-        bufQ.clear();
+        bufSrc.clear(); bufTgt.clear(); bufLangSrc.clear(); bufLangTgt.clear(); bufQ.clear();
     }
 
-    /** Garante que as tabelas/colunas necessárias existem (sem Flyway), de forma idempotente. */
+    // ========= Staging + Consolidação =========
+
+    private void ensureTmStagingSchema() {
+        jdbc.execute("""
+      CREATE TABLE IF NOT EXISTS tm_staging (
+        src       text NOT NULL,
+        tgt       text NOT NULL,
+        lang_src  text NOT NULL,
+        lang_tgt  text NOT NULL,
+        quality   double precision,
+        created_at timestamp default now()
+      )
+    """);
+
+        // Em versões que não suportam ADD CONSTRAINT IF NOT EXISTS, use DO $$ ... $$
+        jdbc.execute("""
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1
+          FROM pg_constraint
+          WHERE conname = 'tm_unique_pair'
+            AND conrelid = 'tm'::regclass
+        ) THEN
+          ALTER TABLE tm
+            ADD CONSTRAINT tm_unique_pair
+            UNIQUE (src, tgt, lang_src, lang_tgt);
+        END IF;
+      END
+      $$;
+    """);
+    }
+
+    private int upsertFromTmStagingToTm() {
+        String sql = """
+        WITH dedup AS (
+          SELECT DISTINCT ON (src, tgt, lang_src, lang_tgt)
+                 src, tgt, lang_src, lang_tgt, quality
+          FROM tm_staging
+          ORDER BY src, tgt, lang_src, lang_tgt, quality DESC
+        )
+        INSERT INTO tm (src, tgt, lang_src, lang_tgt, quality)
+        SELECT src, tgt, lang_src, lang_tgt, quality
+        FROM dedup
+        ON CONFLICT (src, tgt, lang_src, lang_tgt)
+        DO UPDATE
+          SET quality = GREATEST(EXCLUDED.quality, tm.quality)
+    """;
+        int update = jdbc.update(sql);
+        clearTmStaging();
+        return update;
+    }
+
+    private void truncateTmStaging() { jdbc.execute("TRUNCATE tm_staging"); }
+
     private void ensureEmbeddingsSchema() {
-        // staging para texto + vetores
         jdbc.execute("""
         CREATE TABLE IF NOT EXISTS tm_emb_staging (
           src       text NOT NULL,
@@ -538,32 +588,45 @@ public class TMImportServiceImpl implements TMImportService {
           quality   double precision,
           created_at timestamp default now()
         )
-    """);
-
-        // tabela final (se ainda não tiver as colunas)
+        """);
         jdbc.execute("CREATE TABLE IF NOT EXISTS tm_embeddings (tm_id bigint PRIMARY KEY)");
         jdbc.execute("ALTER TABLE tm_embeddings ADD COLUMN IF NOT EXISTS emb_src vector");
         jdbc.execute("ALTER TABLE tm_embeddings ADD COLUMN IF NOT EXISTS emb_tgt vector");
     }
 
-    /** Consolida do staging para tm_embeddings usando tm.id; retorna linhas upsertadas. */
     private int consolidateEmbeddingsFromStaging() {
-        ensureEmbeddingsSchema(); // idempotente
-
-        // Faz o upsert. Observação: se houver MUITO staging, você pode fatiar com LIMIT… (cursor)
         String sql = """
+        WITH dedup AS (
+          SELECT DISTINCT ON (src, tgt, lang_src, lang_tgt)
+                 src, tgt, lang_src, lang_tgt,
+                 emb_src, emb_tgt, quality
+          FROM tm_emb_staging
+          ORDER BY src, tgt, lang_src, lang_tgt, quality DESC, created_at DESC
+        )
         INSERT INTO tm_embeddings (tm_id, emb_src, emb_tgt)
-        SELECT t.id, s.emb_src, s.emb_tgt
+        SELECT t.id, d.emb_src, d.emb_tgt
           FROM tm t
-          JOIN tm_emb_staging s
-            ON t.src = s.src
-           AND t.tgt = s.tgt
-           AND t.lang_src = s.lang_src
-           AND t.lang_tgt = s.lang_tgt
+          JOIN dedup d
+            ON t.src = d.src
+           AND t.tgt = d.tgt
+           AND t.lang_src = d.lang_src
+           AND t.lang_tgt = d.lang_tgt
         ON CONFLICT (tm_id) DO UPDATE
-        SET emb_src = EXCLUDED.emb_src,
-            emb_tgt = COALESCE(EXCLUDED.emb_tgt, tm_embeddings.emb_tgt)
+          SET emb_src = EXCLUDED.emb_src,
+              emb_tgt = COALESCE(EXCLUDED.emb_tgt, tm_embeddings.emb_tgt)
     """;
-        return jdbc.update(sql);
+        int update = jdbc.update(sql);
+        clearEmbStaging(); // <- corrige: limpa tm_emb_staging, não tm_staging
+        return update;
     }
+
+    private void clearTmStaging() {
+        jdbc.execute("TRUNCATE tm_staging");
+    }
+
+    private void clearEmbStaging() {
+        jdbc.execute("TRUNCATE tm_emb_staging");
+    }
+
+    // ========= Fim =========
 }
