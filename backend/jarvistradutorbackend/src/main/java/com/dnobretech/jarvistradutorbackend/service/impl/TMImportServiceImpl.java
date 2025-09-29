@@ -1,6 +1,8 @@
 package com.dnobretech.jarvistradutorbackend.service.impl;
 
 import com.dnobretech.jarvistradutorbackend.domain.ImportCheckpoint;
+
+import com.dnobretech.jarvistradutorbackend.dto.CheckpointDTO;
 import com.dnobretech.jarvistradutorbackend.dto.EmbedResponse;
 import com.dnobretech.jarvistradutorbackend.dto.ExamplePair;
 import com.dnobretech.jarvistradutorbackend.dto.ResumeResult;
@@ -10,11 +12,14 @@ import com.dnobretech.jarvistradutorbackend.util.TextNormalizer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.postgresql.copy.CopyManager;
+import org.postgresql.copy.PGCopyOutputStream;
+import org.postgresql.core.BaseConnection;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.reactive.function.client.ExchangeStrategies;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import javax.sql.DataSource;
@@ -24,7 +29,6 @@ import java.sql.Connection;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
-import org.springframework.web.reactive.function.client.ExchangeStrategies;
 
 @Slf4j
 @Service
@@ -49,6 +53,8 @@ public class TMImportServiceImpl implements TMImportService {
     private double ratioMin;
     @Value("${jarvis.tm.ratio-max:2.0}")
     private double ratioMax;
+
+
 
     // ===================== Upload (multipart) -> COPY (tm_staging) =====================
 
@@ -131,10 +137,15 @@ public class TMImportServiceImpl implements TMImportService {
 
         if (copyErr.get() != null) throw new RuntimeException("COPY (upload) falhou", copyErr.get());
 
-        // Consolidar staging -> tm
+        // Consolidar staging -> tm (dedupe prévio evita ON CONFLICT double-hit)
         int up = upsertFromTmStagingToTm();
         log.info("[upload] staging→tm upserts/updates={}", up);
         truncateTmStaging();
+
+        // Consolidar ocorrências (se estiver usando esse staging; safe mesmo vazio)
+        ensureTmOccurrenceStagingSchema();
+        int occ = upsertFromOccurrenceStagingToOccurrence();
+        log.info("[upload] staging→tm_occurrence inseridos={}", occ);
 
         log.info("Import upload finalizado: lidas={} válidas={}", seen, rows);
         return rows;
@@ -172,57 +183,31 @@ public class TMImportServiceImpl implements TMImportService {
         long processedLines = 0L;
         long totalCopied = 0L;
 
-        Connection con = DataSourceUtils.getConnection(dataSource);
-        final CopyManager cm = con.unwrap(org.postgresql.PGConnection.class).getCopyAPI();
-        final PipedReader pr = new PipedReader(1 << 16);
-        final PipedWriter pw = new PipedWriter(pr);
-        final AtomicReference<Throwable> copyErr = new AtomicReference<>();
+        // === Conexões dedicadas ao COPY (uma para tm_staging e outra opcional para tm_emb_staging) ===
+        Connection conTm = DataSourceUtils.getConnection(dataSource);
+        BaseConnection baseTm = conTm.unwrap(BaseConnection.class);
+        PGCopyOutputStream pgOutTm = new PGCopyOutputStream(
+                baseTm,
+                "COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)"
+        );
+        BufferedWriter out = new BufferedWriter(new OutputStreamWriter(pgOutTm, StandardCharsets.UTF_8), 1 << 16);
+        out.write("src,tgt,lang_src,lang_tgt,quality\n");
 
-        Thread copyThread = new Thread(() -> {
-            try (Reader r = pr) {
-                cm.copyIn("COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)", r);
-            } catch (Throwable t) {
-                copyErr.set(t);
-                log.error("Erro no COPY (resume->staging)", t);
-            }
-        }, "copy-resume-staging");
-        copyThread.start();
-
-        // embeddings staging opcional
         final boolean doEmb = !"none".equals(embedMode);
-        PipedReader prEmb;
-        PipedWriter pwEmb = null;
-        BufferedWriter outEmb = null;
-        Thread copyEmbThread = null;
-        final AtomicReference<Throwable> copyEmbErr = new AtomicReference<>();
+        Connection conEmb = null; BaseConnection baseEmb = null; PGCopyOutputStream pgOutEmb = null; BufferedWriter outEmb = null;
         if (doEmb) {
             ensureEmbeddingsSchema();
-            prEmb = new PipedReader(1 << 16);
-            pwEmb = new PipedWriter(prEmb);
-            outEmb = new BufferedWriter(pwEmb, 1 << 16);
-
-            // Inicia o COPY do staging de embeddings ANTES de escrever
-            copyEmbThread = new Thread(() -> {
-                try (Reader r = prEmb) {
-                    cm.copyIn("""
-                        COPY tm_emb_staging(src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality)
-                        FROM STDIN WITH (FORMAT csv, HEADER true)
-                    """, r);
-                } catch (Throwable t) {
-                    copyEmbErr.set(t);
-                    log.error("Erro COPY (emb_staging)", t);
-                }
-            }, "copy-resume-emb");
-            copyEmbThread.start();
-
-            // escreve header do CSV para o COPY
+            conEmb = DataSourceUtils.getConnection(dataSource);
+            baseEmb = conEmb.unwrap(BaseConnection.class);
+            pgOutEmb = new PGCopyOutputStream(
+                    baseEmb,
+                    "COPY tm_emb_staging(src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)"
+            );
+            outEmb = new BufferedWriter(new OutputStreamWriter(pgOutEmb, StandardCharsets.UTF_8), 1 << 16);
             outEmb.write("src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality\n");
-        } else {
-            prEmb = null;
         }
 
         RandomAccessFile raf = null;
-        BufferedWriter out = null;
         long newOffset;
 
         final int maxExamples = Math.min(Math.max(0, examples), 50);
@@ -244,20 +229,17 @@ public class TMImportServiceImpl implements TMImportService {
                 raf.seek(startOffset);
             } else if (startOffset >= fileSize) {
                 log.info("Nada a fazer: offset >= fileSize ({} >= {})", startOffset, fileSize);
-                out = new BufferedWriter(pw, 1 << 16);
-                out.write("src,tgt,lang_src,lang_tgt,quality\n");
+                // Finaliza corretamente os COPY vazios
                 out.flush();
-                try { out.close(); } catch (IOException ignore) {}
-                try { copyThread.join(120_000); } catch (InterruptedException ignore) {}
-                DataSourceUtils.releaseConnection(con, dataSource);
+                pgOutTm.endCopy();
+                DataSourceUtils.releaseConnection(conTm, dataSource);
 
                 if (doEmb && outEmb != null) {
-                    try { outEmb.flush(); } catch (IOException ignore) {}
-                    try { outEmb.close(); } catch (IOException ignore) {}
-                    try { copyEmbThread.join(120_000); } catch (InterruptedException ignore) {}
+                    outEmb.flush();
+                    pgOutEmb.endCopy();
+                    DataSourceUtils.releaseConnection(conEmb, dataSource);
                 }
 
-                // consolidar (idempotente)
                 int up = upsertFromTmStagingToTm();
                 log.info("[resume] staging→tm upserts/updates (EOF caso offset>=size) = {}", up);
                 truncateTmStaging();
@@ -266,11 +248,11 @@ public class TMImportServiceImpl implements TMImportService {
                 return new ResumeResult(0, startOffset, 0, List.of());
             }
 
-            out = new BufferedWriter(pw, 1 << 16);
-            out.write("src,tgt,lang_src,lang_tgt,quality\n");
-
             int linesThisBatch = 0;
+            int count = 0;
             while (true) {
+                log.info("Count: {}", count);
+                count++;
                 String line = readLineUtf8(raf);
                 if (line == null) break;
 
@@ -288,9 +270,7 @@ public class TMImportServiceImpl implements TMImportService {
                             String langSrc = (cols.length > 2 && !cols[2].isBlank()) ? cols[2] : "en";
                             String langTgt = (cols.length > 3 && !cols[3].isBlank()) ? cols[3] : "pt";
                             String key = src + "\u0001" + tgt + "\u0001" + langSrc + "\u0001" + langTgt;
-                            if (!seen.add(key)) {
-                                // duplicata neste lote
-                            } else {
+                            if (seen.add(key)) {
                                 double q = qualityScore(r, ph);
                                 writeCsvLine(out, src, tgt, langSrc, langTgt, String.valueOf(q));
                                 totalCopied++;
@@ -321,39 +301,30 @@ public class TMImportServiceImpl implements TMImportService {
                             fileKey, linesThisBatch, processedLines, totalCopied, pos);
                 }
 
-                if (linesThisBatch >= batchLines) {
-                    break;
-                }
+                if (linesThisBatch >= batchLines) break;
             }
 
             newOffset = raf.getFilePointer();
 
             out.flush();
             if (doEmb && !bufSrc.isEmpty()) {
-                // apenas flush lógico do último lote; NÃO dar flush do pipe aqui
                 flushEmbeddingsBuffer(outEmb, bufSrc, bufTgt, bufLangSrc, bufLangTgt, bufQ, embedMode);
             }
-            // ⚠️ REMOVIDO: outEmb.flush() aqui pode bloquear o pipe se o COPY não drenou.
-            // O fechamento no finally sinaliza EOF de forma segura.
 
         } finally {
-            // Fecha writer de TM → sinaliza EOF ao COPY e só então faz join.
-            if (out != null) { try { out.close(); } catch (IOException e) { log.debug("Ignorando close(out): {}", e.toString()); } }
-            try { copyThread.join(120_000); } catch (InterruptedException ignore) {}
-            DataSourceUtils.releaseConnection(con, dataSource);
-            if (raf != null) try { raf.close(); } catch (IOException ignore) {}
+            // Fechamentos em ordem: writers → endCopy → release connections
+            try { out.flush(); } catch (IOException ignore) {}
+            try { pgOutTm.endCopy(); } catch (Exception e) { log.warn("endCopy tm_staging: {}", e.toString()); }
+            DataSourceUtils.releaseConnection(conTm, dataSource);
 
-            // Para embeddings: feche o writer (EOF) antes do join da thread COPY.
             if (doEmb && outEmb != null) {
-                try { outEmb.close(); } catch (IOException ignore) {}
-                if (copyEmbThread != null) {
-                    try { copyEmbThread.join(120_000); } catch (InterruptedException ignore) {}
-                }
+                try { outEmb.flush(); } catch (IOException ignore) {}
+                try { pgOutEmb.endCopy(); } catch (Exception e) { log.warn("endCopy tm_emb_staging: {}", e.toString()); }
+                if (conEmb != null) DataSourceUtils.releaseConnection(conEmb, dataSource);
             }
-        }
 
-        if (copyErr.get() != null) throw new RuntimeException("COPY (resume) falhou", copyErr.get());
-        if (doEmb && copyEmbErr.get() != null) throw new RuntimeException("COPY (emb_staging) falhou", copyEmbErr.get());
+            if (raf != null) try { raf.close(); } catch (IOException ignore) {}
+        }
 
         // Consolidar staging → tm
         int up = upsertFromTmStagingToTm();
@@ -365,6 +336,11 @@ public class TMImportServiceImpl implements TMImportService {
             int merged = consolidateEmbeddingsFromStaging();
             log.info("Embeddings consolidados do staging → tm_embeddings: {}", merged);
         }
+
+        // (opcional) consolidar ocorrências se estiver usando esse staging neste fluxo
+        ensureTmOccurrenceStagingSchema();
+        int occ = upsertFromOccurrenceStagingToOccurrence();
+        log.info("[resume] staging→tm_occurrence inseridos={}", occ);
 
         // salvar checkpoint
         ck.setByteOffset(newOffset);
@@ -423,17 +399,38 @@ public class TMImportServiceImpl implements TMImportService {
         if (!seen && b == -1) return null;
         return new String(baos.toByteArray(), StandardCharsets.UTF_8);
     }
-
+    private static Integer writeCsvLineCount = 0;
     private static void writeCsvLine(Writer out, String src, String tgt, String langSrc, String langTgt, String quality) throws IOException {
-        out.write('"'); out.write(esc(src)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(tgt)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(langSrc)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(langTgt)); out.write('"'); out.write(',');
-        if (quality != null && !quality.isBlank()) out.write(quality);
+
+        log.info("writeCsvLineCount: " + writeCsvLineCount);
+        writeCsvLineCount++;
+        if (writeCsvLineCount == 511)
+            log.info("chegou");
+
+        out.write('"');
+        out.write(esc(src));
+        out.write('"');
+        out.write(',');
+        out.write('"');
+        out.write(esc(tgt));
+        out.write('"');
+        out.write(',');
+        out.write('"');
+        out.write(esc(langSrc));
+        out.write('"');
+        out.write(',');
+        out.write('"');
+        out.write(esc(langTgt));
+        out.write('"');
+        out.write(',');
+        if (quality != null && !quality.isBlank())
+            out.write(quality);
         out.write('\n');
     }
 
-    private static String esc(String s) { return s.replace("\"", "\"\""); }
+    private static String esc(String s) {
+        return s.replace("\"", "\"\"");
+    }
 
     private static String normalizeDelimiter(String delimiter) {
         if (delimiter == null) return "\t";
@@ -485,16 +482,21 @@ public class TMImportServiceImpl implements TMImportService {
         return sb.toString();
     }
 
-    private void flushEmbeddingsBuffer(Writer outEmb,
-                                       List<String> bufSrc,
-                                       List<String> bufTgt,
-                                       List<String> bufLangSrc,
-                                       List<String> bufLangTgt,
-                                       List<Double> bufQ,
-                                       String embedMode) throws IOException {
+    private void flushEmbeddingsBuffer(
+            Writer outEmb,
+            List<String> bufSrc, List<String> bufTgt,
+            List<String> bufLangSrc, List<String> bufLangTgt,
+            List<Double> bufQ,
+            String embedMode
+    ) throws IOException {
+        if (outEmb == null) return; // seguro
 
         List<double[]> vecSrc = embedTexts(bufSrc, true);
         List<double[]> vecTgt = "both".equals(embedMode) ? embedTexts(bufTgt, true) : List.of();
+
+        // (opcional) logar dimensão dos vetores para sanity-check
+        if (!vecSrc.isEmpty()) log.info("emb_src dim={}", vecSrc.get(0).length);
+        if (!vecTgt.isEmpty()) log.info("emb_tgt dim={}", vecTgt.get(0).length);
 
         for (int i = 0; i < bufSrc.size(); i++) {
             String src = bufSrc.get(i);
@@ -516,6 +518,8 @@ public class TMImportServiceImpl implements TMImportService {
             outEmb.write(',');
             outEmb.write(Double.toString(q));
             outEmb.write('\n');
+
+            if ((i & 0xFF) == 0) outEmb.flush(); // flush leve a cada 256 linhas
         }
 
         bufSrc.clear(); bufTgt.clear(); bufLangSrc.clear(); bufLangTgt.clear(); bufQ.clear();
@@ -616,7 +620,7 @@ public class TMImportServiceImpl implements TMImportService {
               emb_tgt = COALESCE(EXCLUDED.emb_tgt, tm_embeddings.emb_tgt)
     """;
         int update = jdbc.update(sql);
-        clearEmbStaging(); // <- corrige: limpa tm_emb_staging, não tm_staging
+        clearEmbStaging();
         return update;
     }
 
@@ -626,6 +630,42 @@ public class TMImportServiceImpl implements TMImportService {
 
     private void clearEmbStaging() {
         jdbc.execute("TRUNCATE tm_emb_staging");
+    }
+
+    // ======== Ocorrências (preparado para seriesId/bookId/sourceTag) ========
+
+    private void ensureTmOccurrenceStagingSchema() {
+        jdbc.execute("""
+        CREATE TABLE IF NOT EXISTS tm_occurrence_staging (
+          src       text NOT NULL,
+          tgt       text NOT NULL,
+          lang_src  text NOT NULL,
+          lang_tgt  text NOT NULL,
+          series_id bigint,
+          book_id   bigint,
+          chapter   text,
+          location  text,
+          quality   double precision,
+          source_tag text,
+          created_at timestamp default now()
+        )
+    """);
+    }
+
+    private int upsertFromOccurrenceStagingToOccurrence() {
+        String sql = """
+        INSERT INTO tm_occurrence (tm_id, series_id, book_id, chapter, location, quality_at_import, source_tag)
+        SELECT t.id, s.series_id, s.book_id, s.chapter, s.location, s.quality, s.source_tag
+        FROM tm_occurrence_staging s
+        JOIN tm t
+          ON t.src = s.src
+         AND t.tgt = s.tgt
+         AND t.lang_src = s.lang_src
+         AND t.lang_tgt = s.lang_tgt
+    """;
+        int inserted = jdbc.update(sql);
+        jdbc.execute("TRUNCATE tm_occurrence_staging");
+        return inserted;
     }
 
     // ========= Fim =========

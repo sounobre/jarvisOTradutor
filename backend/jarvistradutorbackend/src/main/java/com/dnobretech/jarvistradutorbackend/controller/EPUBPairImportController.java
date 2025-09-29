@@ -34,10 +34,13 @@ public class EPUBPairImportController {
             @RequestParam(defaultValue = "length") String mode,
             @RequestParam(defaultValue = "en") String srcLang,
             @RequestParam(defaultValue = "pt") String tgtLang,
-            @RequestParam(defaultValue = "0.55") double minQuality
+            @RequestParam(defaultValue = "0.55") double minQuality,
+            @RequestParam(required = false) Long seriesId,
+            @RequestParam(required = false) Long bookId,
+            @RequestParam(required = false) String sourceTag
     ) throws Exception {
         Result r = service.importParallelEPUB(
-                fileEn, filePt, level, mode, srcLang, tgtLang, minQuality
+                fileEn, filePt, level, mode, srcLang, tgtLang, minQuality, seriesId, bookId, sourceTag
         );
         return ResponseEntity.ok(java.util.Map.of(
                 "ok", true,

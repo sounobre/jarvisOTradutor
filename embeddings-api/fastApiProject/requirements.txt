@@ -8,3 +8,4 @@ numpy==1.26.4
 pydantic==2.8.2
 pydantic-settings==2.4.0
 redis==5.0.8           # opcional, se usar cache externo
+pymongo>=4.7,<5
