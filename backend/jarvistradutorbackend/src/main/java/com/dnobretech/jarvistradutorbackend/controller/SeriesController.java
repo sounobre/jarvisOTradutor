@@ -1,7 +1,8 @@
+// src/main/java/com/dnobretech/jarvistradutorbackend/controller/SeriesController.java
 package com.dnobretech.jarvistradutorbackend.controller;
 
-import com.dnobretech.jarvistradutorbackend.domain.Series;
 import com.dnobretech.jarvistradutorbackend.dto.SeriesCreateDTO;
+import com.dnobretech.jarvistradutorbackend.dto.SeriesDTO;
 import com.dnobretech.jarvistradutorbackend.dto.SeriesUpdateDTO;
 import com.dnobretech.jarvistradutorbackend.service.SeriesService;
 import jakarta.validation.Valid;
@@ -18,22 +19,27 @@ public class SeriesController {
     private final SeriesService service;
 
     @PostMapping
-    public Series create(@RequestBody @Valid SeriesCreateDTO dto) {
+    public SeriesDTO create(@RequestBody @Valid SeriesCreateDTO dto) {
         return service.create(dto);
     }
 
     @GetMapping("/{id}")
-    public Series get(@PathVariable Long id) {
+    public SeriesDTO get(@PathVariable Long id) {
         return service.get(id);
     }
 
     @GetMapping
-    public List<Series> list() {
+    public List<SeriesDTO> list() {
         return service.list();
     }
 
-    @PatchMapping("/{id}")
-    public Series update(@PathVariable Long id, @RequestBody @Valid SeriesUpdateDTO dto) {
+    @GetMapping("/author/{id}")
+    public List<SeriesDTO> listByAuthorId(@PathVariable Long id) {
+        return service.findAllByAuthor(id);
+    }
+
+    @PutMapping("/{id}")
+    public SeriesDTO update(@PathVariable Long id, @RequestBody @Valid SeriesUpdateDTO dto) {
         return service.update(id, dto);
     }
 

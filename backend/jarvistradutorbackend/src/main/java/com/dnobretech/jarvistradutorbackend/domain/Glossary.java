@@ -35,4 +35,6 @@ public class Glossary {
 
     @Column(name = "created_at")
     private OffsetDateTime createdAt;                       // timestamp
+
+    private Long seriesId; // getter/setter
 }

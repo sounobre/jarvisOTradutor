@@ -1,13 +1,12 @@
+// src/main/java/com/dnobretech/jarvistradutorbackend/dto/SeriesCreateDTO.java
 package com.dnobretech.jarvistradutorbackend.dto;
 
 import jakarta.validation.constraints.NotBlank;
-import lombok.Data;
+import jakarta.validation.constraints.NotNull;
 
-@Data
-public class SeriesCreateDTO {
-    @NotBlank
-    private String name;
-    @NotBlank
-    private String slug;
-    private String description;
-}
+public record SeriesCreateDTO(
+        @NotBlank String name,
+        String slug,
+        @NotNull Long authorId,        // obrigatório via @NotNull se preferir
+        String description
+) {}
