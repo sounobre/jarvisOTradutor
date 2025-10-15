@@ -2,7 +2,7 @@
 import type { ReactNode } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import type { LucideIcon } from 'lucide-react'
-import { BookOpen, Book, Boxes, FileUp, FolderPlus, Search, Settings as Cog } from 'lucide-react'
+import { BookOpen, Book, Boxes, FileUp, FolderPlus, Search, Settings as Cog, Inbox, Shuffle } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 
@@ -37,6 +37,8 @@ export function Layout({ children }: { children: ReactNode }) {
         </div>
         <nav className='flex flex-col gap-1'>
           <NavItem to='/' icon={BookOpen} label='Dashboard' />
+          <NavItem to='/inbox/bookpairs' icon={Inbox} label='Inbox (Pares)' />
+          <NavItem to='/inbox/consolidate' icon={Shuffle} label='Consolidação' />
           <NavItem to='/glossary/bulk' icon={Boxes} label='Glossário Bulk' />
           <NavItem to='/tm/import' icon={FileUp} label='TM Import' />
           <NavItem to='/tm/tools' icon={Search} label='TM Lookup/Learn' />

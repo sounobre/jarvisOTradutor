@@ -18,6 +18,7 @@ import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.util.Locale;
+import java.util.regex.Pattern;
 
 @Service
 @RequiredArgsConstructor
@@ -25,9 +26,12 @@ public class TMXImportServiceImpl implements TMXImportService {
 
     private final DataSource dataSource;
     private final TextNormalizer norm;
+    private static final Pattern PLACEHOLDERS = Pattern.compile("(\\{[^}]+\\}|%s|%d|<[^>]+>|\\$\\{[^}]+\\})");
 
-    @Value("${jarvis.tm.ratio-min:0.5}") private double ratioMin;
-    @Value("${jarvis.tm.ratio-max:2.0}") private double ratioMax;
+    @Value("${jarvis.tm.ratio-min:0.5}")
+    private double ratioMin;
+    @Value("${jarvis.tm.ratio-max:2.0}")
+    private double ratioMax;
 
     public long importTmx(MultipartFile file, String srcLang, String tgtLang) throws Exception {
         final String srcL = normalizeLang(srcLang);
@@ -65,7 +69,10 @@ public class TMXImportServiceImpl implements TMXImportService {
             XMLInputFactory f = XMLInputFactory.newFactory();
             // Segurança
             f.setProperty(XMLInputFactory.SUPPORT_DTD, false);
-            try { f.setProperty("javax.xml.stream.isSupportingExternalEntities", false); } catch (Exception ignore) {}
+            try {
+                f.setProperty("javax.xml.stream.isSupportingExternalEntities", false);
+            } catch (Exception ignore) {
+            }
             // Performance
             f.setProperty(XMLInputFactory.IS_COALESCING, true); // junta textos adjacentes
 
@@ -85,7 +92,9 @@ public class TMXImportServiceImpl implements TMXImportService {
                 if (ev == XMLStreamConstants.START_ELEMENT) {
                     String name = xr.getLocalName();
                     if ("tu".equalsIgnoreCase(name)) {
-                        segSrc = null; segTgt = null; curLang = null;
+                        segSrc = null;
+                        segTgt = null;
+                        curLang = null;
                     } else if ("tuv".equalsIgnoreCase(name)) {
                         curLang = normalizeLang(getAttr(xr, "xml:lang"));
                         if (curLang.isEmpty()) curLang = normalizeLang(getAttr(xr, "lang"));
@@ -97,8 +106,7 @@ public class TMXImportServiceImpl implements TMXImportService {
                             if (isLangMatch(curLang, tgtL) && segTgt == null) segTgt = new StringBuilder(128);
                         }
                     }
-                }
-                else if (ev == XMLStreamConstants.CHARACTERS) {
+                } else if (ev == XMLStreamConstants.CHARACTERS) {
                     if (inSeg && curLang != null) {
                         CharSequence text = xr.getTextCharacters() != null ? xr.getText() : "";
                         if (text.length() > 0) {
@@ -106,8 +114,7 @@ public class TMXImportServiceImpl implements TMXImportService {
                             else if (isLangMatch(curLang, tgtL) && segTgt != null) segTgt.append(text);
                         }
                     }
-                }
-                else if (ev == XMLStreamConstants.END_ELEMENT) {
+                } else if (ev == XMLStreamConstants.END_ELEMENT) {
                     String name = xr.getLocalName();
                     if ("seg".equalsIgnoreCase(name)) {
                         inSeg = false;
@@ -117,15 +124,18 @@ public class TMXImportServiceImpl implements TMXImportService {
                             String src = norm.normalize(maybeStrip(segSrc));
                             String tgt = norm.normalize(maybeStrip(segTgt));
                             if (!src.isBlank() && !tgt.isBlank()) {
-                                double r = norm.lengthRatio(src, tgt);
-                                if (r >= ratioMin && r <= ratioMax && norm.placeholdersPreserved(src, tgt)) {
+                                double r = lengthRatio(src, tgt);
+                                if (r >= ratioMin && r <= ratioMax && placeholdersPreserved(src, tgt)) {
                                     writeCsvLine(out, src, tgt, srcL, tgtL);
                                     rows++;
                                 }
                             }
                         }
                         // limpa para o próximo TU
-                        segSrc = null; segTgt = null; curLang = null; inSeg = false;
+                        segSrc = null;
+                        segTgt = null;
+                        curLang = null;
+                        inSeg = false;
                         if (tus % 100_000 == 0) {
                             // log simples de progresso
                             System.out.printf("TMX TU processadas: %,d | linhas válidas: %,d%n", tus, rows);
@@ -166,7 +176,7 @@ public class TMXImportServiceImpl implements TMXImportService {
 
     private static String normalizeLang(String s) {
         if (s == null) return "";
-        return s.trim().replace('_','-').toLowerCase(Locale.ROOT);
+        return s.trim().replace('_', '-').toLowerCase(Locale.ROOT);
     }
 
     private static boolean isLangMatch(String a, String b) {
@@ -188,15 +198,42 @@ public class TMXImportServiceImpl implements TMXImportService {
     }
 
     private static void writeCsvLine(Writer out, String src, String tgt, String srcL, String tgtL) throws IOException {
-        out.write('"'); out.write(esc(src)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(tgt)); out.write('"'); out.write(',');
-        out.write('"'); out.write(srcL); out.write('"'); out.write(',');
-        out.write('"'); out.write(tgtL); out.write('"'); out.write(',');
+        out.write('"');
+        out.write(esc(src));
+        out.write('"');
+        out.write(',');
+        out.write('"');
+        out.write(esc(tgt));
+        out.write('"');
+        out.write(',');
+        out.write('"');
+        out.write(srcL);
+        out.write('"');
+        out.write(',');
+        out.write('"');
+        out.write(tgtL);
+        out.write('"');
+        out.write(',');
         // quality vazio
         out.write('\n');
     }
 
     private static String esc(String s) {
         return s.replace("\"", "\"\"");
+    }
+
+    public boolean placeholdersPreserved(String src, String tgt) {
+        var ms = PLACEHOLDERS.matcher(src);
+        while (ms.find()) {
+            String ph = ms.group();
+            if (!tgt.contains(ph)) return false;
+        }
+        return true;
+    }
+
+    private double lengthRatio(String src, String tgt) {
+        double a = Math.max(1, src.length());
+        double b = Math.max(1, tgt.length());
+        return b / a;
     }
 }

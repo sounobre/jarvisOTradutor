@@ -2,6 +2,7 @@ package com.dnobretech.jarvistradutorbackend.domain;
 
 import com.dnobretech.jarvistradutorbackend.enums.BookType;
 import jakarta.persistence.*;
+import jakarta.validation.constraints.NotNull;
 import lombok.*;
 
 import java.time.Instant;
@@ -21,6 +22,7 @@ public class Book {
     private Long id;
 
     /** vínculo opcional com série */
+    @NotNull
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "series_id", foreignKey = @ForeignKey(name = "fk_book_series"))
     private Series series;

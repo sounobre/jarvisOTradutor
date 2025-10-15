@@ -2,11 +2,13 @@ package com.dnobretech.jarvistradutorbackend.dto;
 
 import com.dnobretech.jarvistradutorbackend.enums.BookType;
 import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
 @Data
 public class BookCreateDTO {
-    private Long seriesId;           // opcional
+    @NotNull
+    private Long seriesId;
     @NotBlank
     private String title;
     private String volumeNumber;

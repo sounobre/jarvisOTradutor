@@ -22,7 +22,7 @@ public class BookController {
     private final BookService service;
 
     @PostMapping
-    public Book create(@RequestBody @Valid BookCreateDTO dto) {
+    public BookResponse create(@RequestBody @Valid BookCreateDTO dto) {
         return service.create(dto);
     }
 

@@ -29,6 +29,7 @@ import java.sql.Connection;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 @Slf4j
 @Service
@@ -39,6 +40,8 @@ public class TMImportServiceImpl implements TMImportService {
     private final DataSource dataSource;
     private final ImportCheckpointRepository checkpointRepo;
     private final JdbcTemplate jdbc; // DDL/merge
+
+    private static final Pattern PLACEHOLDERS = Pattern.compile("(\\{[^}]+\\}|%s|%d|<[^>]+>|\\$\\{[^}]+\\})");
 
     private final WebClient embClient = WebClient.builder()
             .baseUrl("http://localhost:8001")
@@ -60,7 +63,7 @@ public class TMImportServiceImpl implements TMImportService {
 
     @Override
     public long importTsvOrCsvStreaming(MultipartFile file, String delimiter) throws Exception {
-        ensureTmStagingSchema();
+        ensureCorpInboxSchema();
 
         final String delim = normalizeDelimiter(delimiter);
         log.info("Import upload iniciado: filename='{}', delimiter='{}'",
@@ -105,9 +108,9 @@ public class TMImportServiceImpl implements TMImportService {
                 String tgt = norm.normalize(cols[1]);
                 if (src.isBlank() || tgt.isBlank()) continue;
 
-                double r = norm.lengthRatio(src, tgt);
+                double r = lengthRatio(src, tgt);
                 if (r < ratioMin || r > ratioMax) continue;
-                if (!norm.placeholdersPreserved(src, tgt)) continue;
+                if (!placeholdersPreserved(src, tgt)) continue;
 
                 String langSrc = (cols.length > 2 && !cols[2].isBlank()) ? cols[2] : "en";
                 String langTgt = (cols.length > 3 && !cols[3].isBlank()) ? cols[3] : "pt";
@@ -156,7 +159,7 @@ public class TMImportServiceImpl implements TMImportService {
     @Override
     public ResumeResult importTxtResume(String path, String delimiter, String fileKey, int batchLines,
                                         int examples, String embed) throws Exception {
-        ensureTmStagingSchema();
+        ensureCorpInboxSchema();
 
         final String delim = normalizeDelimiter(delimiter);
         final String embedMode = (embed == null ? "none" : embed.toLowerCase(Locale.ROOT)); // none|src|both
@@ -185,13 +188,19 @@ public class TMImportServiceImpl implements TMImportService {
 
         // === Conexões dedicadas ao COPY (uma para tm_staging e outra opcional para tm_emb_staging) ===
         Connection conTm = DataSourceUtils.getConnection(dataSource);
-        BaseConnection baseTm = conTm.unwrap(BaseConnection.class);
-        PGCopyOutputStream pgOutTm = new PGCopyOutputStream(
-                baseTm,
-                "COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)"
+        BaseConnection base = conTm.unwrap(BaseConnection.class);
+//        PGCopyOutputStream pgOutTm = new PGCopyOutputStream(
+//                baseTm,
+//                "COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)"
+//        );
+        PGCopyOutputStream pgOut = new PGCopyOutputStream(
+                base,
+                "COPY tm_corpora_inbox(src,tgt,lang_src,lang_tgt,quality,source_tag) " +
+                        "FROM STDIN WITH (FORMAT csv, HEADER true)"
         );
-        BufferedWriter out = new BufferedWriter(new OutputStreamWriter(pgOutTm, StandardCharsets.UTF_8), 1 << 16);
-        out.write("src,tgt,lang_src,lang_tgt,quality\n");
+        BufferedWriter out = new BufferedWriter(new OutputStreamWriter(pgOut, StandardCharsets.UTF_8), 1 << 16);
+        //out.write("src,tgt,lang_src,lang_tgt,quality\n");
+        out.write("src,tgt,lang_src,lang_tgt,quality,source_tag\n");
 
         final boolean doEmb = !"none".equals(embedMode);
         Connection conEmb = null; BaseConnection baseEmb = null; PGCopyOutputStream pgOutEmb = null; BufferedWriter outEmb = null;
@@ -231,7 +240,7 @@ public class TMImportServiceImpl implements TMImportService {
                 log.info("Nada a fazer: offset >= fileSize ({} >= {})", startOffset, fileSize);
                 // Finaliza corretamente os COPY vazios
                 out.flush();
-                pgOutTm.endCopy();
+                pgOut.endCopy();
                 DataSourceUtils.releaseConnection(conTm, dataSource);
 
                 if (doEmb && outEmb != null) {
@@ -264,8 +273,8 @@ public class TMImportServiceImpl implements TMImportService {
                     String src = norm.normalize(cols[0]);
                     String tgt = norm.normalize(cols[1]);
                     if (!src.isBlank() && !tgt.isBlank()) {
-                        double r = norm.lengthRatio(src, tgt);
-                        boolean ph = norm.placeholdersPreserved(src, tgt);
+                        double r = lengthRatio(src, tgt);
+                        boolean ph = placeholdersPreserved(src, tgt);
                         if (r >= ratioMin && r <= ratioMax && ph) {
                             String langSrc = (cols.length > 2 && !cols[2].isBlank()) ? cols[2] : "en";
                             String langTgt = (cols.length > 3 && !cols[3].isBlank()) ? cols[3] : "pt";
@@ -314,7 +323,7 @@ public class TMImportServiceImpl implements TMImportService {
         } finally {
             // Fechamentos em ordem: writers → endCopy → release connections
             try { out.flush(); } catch (IOException ignore) {}
-            try { pgOutTm.endCopy(); } catch (Exception e) { log.warn("endCopy tm_staging: {}", e.toString()); }
+            try { pgOut.endCopy(); } catch (Exception e) { log.warn("endCopy tm_staging: {}", e.toString()); }
             DataSourceUtils.releaseConnection(conTm, dataSource);
 
             if (doEmb && outEmb != null) {
@@ -399,13 +408,9 @@ public class TMImportServiceImpl implements TMImportService {
         if (!seen && b == -1) return null;
         return new String(baos.toByteArray(), StandardCharsets.UTF_8);
     }
-    private static Integer writeCsvLineCount = 0;
+
     private static void writeCsvLine(Writer out, String src, String tgt, String langSrc, String langTgt, String quality) throws IOException {
 
-        log.info("writeCsvLineCount: " + writeCsvLineCount);
-        writeCsvLineCount++;
-        if (writeCsvLineCount == 511)
-            log.info("chegou");
 
         out.write('"');
         out.write(esc(src));
@@ -527,36 +532,53 @@ public class TMImportServiceImpl implements TMImportService {
 
     // ========= Staging + Consolidação =========
 
-    private void ensureTmStagingSchema() {
+
+    private void ensureCorpInboxSchema() {
         jdbc.execute("""
-      CREATE TABLE IF NOT EXISTS tm_staging (
-        src       text NOT NULL,
-        tgt       text NOT NULL,
-        lang_src  text NOT NULL,
-        lang_tgt  text NOT NULL,
-        quality   double precision,
-        created_at timestamp default now()
+      CREATE TABLE IF NOT EXISTS tm_corpora_inbox (
+        id bigserial PRIMARY KEY,
+        src text NOT NULL, tgt text NOT NULL, lang_src text NOT NULL, lang_tgt text NOT NULL,
+        quality double precision,
+        source_tag text,
+        status text NOT NULL DEFAULT 'pending',
+        reviewer text, reviewed_at timestamp,
+        created_at timestamp default now(),
+        CONSTRAINT uk_corpora_inbox UNIQUE (src, tgt, lang_src, lang_tgt, coalesce(source_tag,''))
       )
     """);
-
-        // Em versões que não suportam ADD CONSTRAINT IF NOT EXISTS, use DO $$ ... $$
-        jdbc.execute("""
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1
-          FROM pg_constraint
-          WHERE conname = 'tm_unique_pair'
-            AND conrelid = 'tm'::regclass
-        ) THEN
-          ALTER TABLE tm
-            ADD CONSTRAINT tm_unique_pair
-            UNIQUE (src, tgt, lang_src, lang_tgt);
-        END IF;
-      END
-      $$;
-    """);
     }
+
+
+//    private void ensureTmStagingSchema() {
+//        jdbc.execute("""
+//      CREATE TABLE IF NOT EXISTS tm_staging (
+//        src       text NOT NULL,
+//        tgt       text NOT NULL,
+//        lang_src  text NOT NULL,
+//        lang_tgt  text NOT NULL,
+//        quality   double precision,
+//        created_at timestamp default now()
+//      )
+//    """);
+//
+//        // Em versões que não suportam ADD CONSTRAINT IF NOT EXISTS, use DO $$ ... $$
+//        jdbc.execute("""
+//      DO $$
+//      BEGIN
+//        IF NOT EXISTS (
+//          SELECT 1
+//          FROM pg_constraint
+//          WHERE conname = 'tm_unique_pair'
+//            AND conrelid = 'tm'::regclass
+//        ) THEN
+//          ALTER TABLE tm
+//            ADD CONSTRAINT tm_unique_pair
+//            UNIQUE (src, tgt, lang_src, lang_tgt);
+//        END IF;
+//      END
+//      $$;
+//    """);
+//    }
 
     private int upsertFromTmStagingToTm() {
         String sql = """
@@ -666,6 +688,21 @@ public class TMImportServiceImpl implements TMImportService {
         int inserted = jdbc.update(sql);
         jdbc.execute("TRUNCATE tm_occurrence_staging");
         return inserted;
+    }
+
+    public boolean placeholdersPreserved(String src, String tgt) {
+        var ms = PLACEHOLDERS.matcher(src);
+        while (ms.find()) {
+            String ph = ms.group();
+            if (!tgt.contains(ph)) return false;
+        }
+        return true;
+    }
+
+    private double lengthRatio(String src, String tgt) {
+        double a = Math.max(1, src.length());
+        double b = Math.max(1, tgt.length());
+        return b / a;
     }
 
     // ========= Fim =========

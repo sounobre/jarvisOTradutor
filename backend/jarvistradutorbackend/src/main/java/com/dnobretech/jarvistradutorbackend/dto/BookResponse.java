@@ -1,5 +1,8 @@
 package com.dnobretech.jarvistradutorbackend.dto;
 
+import lombok.Builder;
+
+@Builder
 public record BookResponse(
         Long id,
         String volumeNumber,
@@ -13,5 +16,7 @@ public record BookResponse(
         String isbn13Br,
         Boolean downloaded,
         Boolean pairsImported,
-        SeriesSummaryDTO series
+        Long seriesId
+
+
 ) {}

@@ -1,8 +1,10 @@
 package com.dnobretech.jarvistradutorbackend.service.impl;
 
+import com.dnobretech.jarvistradutorbackend.domain.Author;
 import com.dnobretech.jarvistradutorbackend.domain.Book;
 import com.dnobretech.jarvistradutorbackend.domain.Series;
 import com.dnobretech.jarvistradutorbackend.dto.*;
+import com.dnobretech.jarvistradutorbackend.repository.AuthorRepository;
 import com.dnobretech.jarvistradutorbackend.repository.BookRepository;
 import com.dnobretech.jarvistradutorbackend.repository.SeriesRepository;
 import com.dnobretech.jarvistradutorbackend.service.BookService;
@@ -22,10 +24,12 @@ public class BookServiceImpl implements BookService {
 
     private final BookRepository repo;
     private final SeriesRepository seriesRepo;
+    private final AuthorRepository authorRepository;
 
     @Override
     @Transactional
-    public Book create(BookCreateDTO dto) {
+    public BookResponse create(BookCreateDTO dto) {
+
         Series series = null;
         if (dto.getSeriesId() != null) {
             series = seriesRepo.findById(dto.getSeriesId())
@@ -50,8 +54,22 @@ public class BookServiceImpl implements BookService {
                 .createdAt(Instant.now())
                 .updatedAt(Instant.now())
                 .build();
-
-        return repo.save(b);
+        Book book = repo.save(b);
+        return BookResponse.builder()
+                .id(book.getId())
+                .volumeNumber(String.valueOf(book.getVolumeNumber()))
+                .originalTitleEn(book.getOriginalTitleEn())
+                .titlePtBr(book.getTitlePtBr())
+                .type(book.getType() != null ? book.getType().name() : null)
+                .yearOriginal(book.getYearOriginal())
+                .yearBr(book.getYearBr())
+                .publisherBr(book.getPublisherBr())
+                .translatorBr(book.getTranslatorBr())
+                .isbn13Br(book.getIsbn13Br())
+                .downloaded(book.getDownloaded())
+                .pairsImported(book.getPairsImported())
+                .seriesId(series.getId())
+                .build();
     }
 
     @Override
@@ -153,7 +171,7 @@ public class BookServiceImpl implements BookService {
         );
     }
 
-    private static AuthorSummaryDTO toAuthorDTO(com.dnobretech.jarvistradutorbackend.domain.Author a) {
+    private static AuthorSummaryDTO toAuthorDTO(Author a) {
         return (a == null) ? null : new AuthorSummaryDTO(a.getId(), a.getName());
     }
     private static SeriesSummaryDTO toSeriesDTO(Series s) {
@@ -174,7 +192,8 @@ public class BookServiceImpl implements BookService {
                 b.getIsbn13Br(),
                 b.getDownloaded(),
                 b.getPairsImported(),
-                toSeriesDTO(b.getSeries())
+                b.getSeries().getId()
+
         );
     }
 }

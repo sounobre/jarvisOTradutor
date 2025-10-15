@@ -31,7 +31,7 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
 
     private final SeriesRepository seriesRepo;
     private final BookRepository bookRepo;
-    private final AuthorRepository authorRepo; // <-- ADICIONE
+    private final AuthorRepository authorRepo;
 
     // --------- IMPORT ---------
     @Transactional
@@ -40,10 +40,10 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
         try (Workbook wb = WorkbookFactory.create(file.getInputStream())) {
             Sheet sh = wb.getSheetAt(0);
             if (sh.getPhysicalNumberOfRows() < 2) {
-                return new CatalogImportResult(0,0,0);
+                return new CatalogImportResult(0, 0, 0);
             }
 
-            Map<String,Integer> col = headerIndex(sh.getRow(0));
+            Map<String, Integer> col = headerIndex(sh.getRow(0));
             int created = 0, updated = 0, skipped = 0;
 
             for (int r = 1; r <= sh.getLastRowNum(); r++) {
@@ -52,12 +52,13 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
                     continue;
                 }
 
-                String serieName   = str(row, col, "SerieOuUniverso");
-                String authorName  = str(row, col, "Autor");
-                String country     = str(row, col, "PaisAutor");
-                String period      = str(row, col, "PeriodoAtivo");
+                String serieName = str(row, col, "SerieOuUniverso");
+                String authorName = str(row, col, "Autor");
+                String country = str(row, col, "PaisAutor");
+                String period = str(row, col, "PeriodoAtivo");
                 if (serieName == null || serieName.isBlank()) {
-                    skipped++; continue;
+                    skipped++;
+                    continue;
                 }
 
                 // 1) resolve/cria AUTHOR
@@ -89,14 +90,14 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
 
                 String vol = str(row, col, "NumeroNaSerie");
                 String originalEn = str(row, col, "TituloOriginalEN");
-                if(originalEn.equalsIgnoreCase("Coraline")){
+                if (originalEn.equalsIgnoreCase("Coraline")) {
                     log.info("chegou");
                 }
                 if (opt.isEmpty() && vol != null && !series.getName().equalsIgnoreCase("standalone")) {
                     opt = bookRepo.findBySeriesAndVolumeNumber(series, vol);
                 }
 
-                if (opt.isEmpty() && originalEn != null && !originalEn.isBlank()){
+                if (opt.isEmpty() && originalEn != null && !originalEn.isBlank()) {
                     opt = bookRepo.findBySeriesAndOriginalTitleEnIgnoreCase(series, originalEn);
                 }
 
@@ -116,17 +117,17 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
                 b.setPublisherBr(str(row, col, "EditoraBR"));
                 b.setTranslatorBr(str(row, col, "TradutorBR"));
                 b.setIsbn13Br(isbn);
-                b.setDownloaded(toBool(row, col, "Baixado"));
-                b.setPathEn(str(row, col, "Caminho versão em Inglês"));
-                b.setPathPt(str(row, col, "Caminho versão em Português"));
-                b.setPairsImported(toBool(row, col, "Já foi feita a importação dos pares"));
+                b.setDownloaded(Boolean.TRUE);
+                b.setPathEn( strAny(row, col, "caminhoIngles", "Caminho versão em Inglês") );
+                b.setPathPt( strAny(row, col, "CaminhoPortugues", "Caminho versão em Português") );
+                b.setPairsImported( toBoolAny(row, col, "paresImportados", "Já foi feita a importação dos pares") );
                 b.setUpdatedAt(Instant.now());
 
                 boolean isNew = (b.getId() == null);
                 bookRepo.save(b);
                 if (isNew) {
                     created++;
-                } else{
+                } else {
                     updated++;
                 }
             }
@@ -154,89 +155,111 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
                 write(row, 1,  a != null ? nvl(a.getCountry()) : "");
                 write(row, 2,  a != null ? nvl(a.getActivePeriod()) : "");
                 write(row, 3,  s != null ? nvl(s.getName()) : "");
-                write(row, 4, b.getVolumeNumber());
+                write(row, 4,  b.getVolumeNumber());
                 write(row, 5,  nvl(b.getOriginalTitleEn()));
-                write(row, 6,  nvl(b.getTitlePtBr()));
-                write(row, 7,  b.getType() != null ? b.getType().name() : "");
-                writeNum(row, 8,  b.getYearOriginal());
-                writeNum(row, 9,  b.getYearBr());
-                write(row, 10, nvl(b.getPublisherBr()));
-                write(row, 11, nvl(b.getTranslatorBr()));
-                write(row, 12, nvl(b.getIsbn13Br()));
-                writeBool(row,13, b.getDownloaded());
-                write(row, 14, nvl(b.getPathEn()));
-                write(row, 15, nvl(b.getPathPt()));
-                writeBool(row,16, b.getPairsImported());
+                write(row, 6,  nvl(b.getPathEn()));           // caminhoIngles
+                write(row, 7,  nvl(b.getPathPt()));           // CaminhoPortugues
+                write(row, 8,  nvl(b.getTitlePtBr()));
+                write(row, 9,  b.getType() != null ? b.getType().name() : "");
+                writeNum(row,10, b.getYearOriginal());
+                writeNum(row,11, b.getYearBr());
+                write(row, 12, nvl(b.getPublisherBr()));
+                write(row, 13, nvl(b.getTranslatorBr()));
+                write(row, 14, nvl(b.getIsbn13Br()));
+                writeBool(row,15, b.getPairsImported());      // paresImportados
+
             }
 
-            for (int i=0;i<17;i++) sh.autoSizeColumn(i);
-            ByteArrayOutputStream bos = new ByteArrayOutputStream(1<<20);
+            for (int i = 0; i < 16; i++) sh.autoSizeColumn(i);  // 0..15
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(1 << 20);
             wb.write(bos);
             return bos.toByteArray();
         }
     }
 
     // ---------- helpers ----------
-    private static Map<String,Integer> headerIndex(Row header) {
-        Map<String,Integer> map = new HashMap<>();
-        for (int i=0;i<header.getLastCellNum();i++) {
+    private static Map<String, Integer> headerIndex(Row header) {
+        Map<String, Integer> map = new HashMap<>();
+        for (int i = 0; i < header.getLastCellNum(); i++) {
             String h = header.getCell(i) != null ? header.getCell(i).getStringCellValue() : null;
             if (h != null) map.put(h.trim(), i);
         }
         // validação mínima
-        List<String> required = List.of("TituloOriginalEN","TituloPTBR");
+        List<String> required = List.of("TituloOriginalEN", "TituloPTBR");
         for (String r : required)
             if (!map.containsKey(r))
                 throw new IllegalArgumentException("Header ausente: " + r);
         return map;
     }
 
-    private static String str(Row r, Map<String,Integer> col, String h) {
-        Integer i = col.get(h); if (i==null) return null;
-        Cell c = r.getCell(i); if (c==null) return null;
+    private static String str(Row r, Map<String, Integer> col, String h) {
+        Integer i = col.get(h);
+        if (i == null) return null;
+        Cell c = r.getCell(i);
+        if (c == null) return null;
         c.setCellType(CellType.STRING);
         String s = c.getStringCellValue();
         return s != null ? s.trim() : null;
     }
-    private static Integer toInt(Row r, Map<String,Integer> col, String h) {
-        String s = str(r,col,h);
+
+    private static Integer toInt(Row r, Map<String, Integer> col, String h) {
+        String s = str(r, col, h);
         try {
-            return (s==null||s.isBlank()) ? null : Integer.parseInt(s.replaceAll("[^0-9-]",""));
-        } catch (Exception e){
+            return (s == null || s.isBlank()) ? null : Integer.parseInt(s.replaceAll("[^0-9-]", ""));
+        } catch (Exception e) {
             return null;
         }
     }
-    private static Boolean toBool(Row r, Map<String,Integer> col, String h) {
-        String s = Optional.ofNullable(str(r,col,h)).orElse("").toLowerCase(Locale.ROOT);
+
+    private static Boolean toBool(Row r, Map<String, Integer> col, String h) {
+        String s = Optional.ofNullable(str(r, col, h)).orElse("").toLowerCase(Locale.ROOT);
         return switch (s) {
-            case "1","true","t","sim","s","y","yes" -> true;
-            case "0","false","f","nao","não","n","no" -> false;
+            case "1", "true", "t", "sim", "s", "y", "yes" -> true;
+            case "0", "false", "f", "nao", "não", "n", "no" -> false;
             default -> null;
         };
     }
-    private static BookType parseType(String s) {
-        if (s==null) return null;
-        try { return BookType.valueOf(s.trim().toUpperCase(Locale.ROOT)); }
-        catch (Exception e){ return BookType.OUTRO; }
-    }
-    private static String nvl(String s){ return s==null? "" : s; }
 
-    private static void writeHeader(Row r){
-        String[] h = {
-                "Autor","PaisAutor","PeriodoAtivo","SerieOuUniverso","NumeroNaSerie",
-                "TituloOriginalEN","TituloPTBR","Tipo","AnoPublicacaoOriginal","AnoPublicacaoBR",
-                "EditoraBR","TradutorBR","ISBN13_BR","Baixado","Caminho versão em Inglês",
-                "Caminho versão em Português","Já foi feita a importação dos pares"
-        };
-        for (int i=0;i<h.length;i++) r.createCell(i).setCellValue(h[i]);
+    private static BookType parseType(String s) {
+        if (s == null) return null;
+        try {
+            return BookType.valueOf(s.trim().toUpperCase(Locale.ROOT));
+        } catch (Exception e) {
+            return BookType.OUTRO;
+        }
     }
-    private static void write(Row r, int i, String v){ r.createCell(i, CellType.STRING).setCellValue(v==null? "" : v); }
-    private static void writeNum(Row r, int i, Integer v){ if (v==null) write(r,i,""); else r.createCell(i, CellType.NUMERIC).setCellValue(v); }
-    private static void writeBool(Row r, int i, Boolean v){ write(r,i, v==null? "" : (v? "true":"false")); }
+
+    private static String nvl(String s) {
+        return s == null ? "" : s;
+    }
+
+    private static void writeHeader(Row r) {
+        String[] h = {
+                "Autor", "PaisAutor", "PeriodoAtivo", "SerieOuUniverso", "NumeroNaSerie",
+                "TituloOriginalEN", "caminhoIngles", "CaminhoPortugues", "TituloPTBR", "Tipo",
+                "AnoPublicacaoOriginal", "AnoPublicacaoBR", "EditoraBR", "TradutorBR", "ISBN13_BR", "paresImportados"
+        };
+        for (int i = 0; i < h.length; i++) r.createCell(i).setCellValue(h[i]);
+    }
+
+    private static void write(Row r, int i, String v) {
+        r.createCell(i, CellType.STRING).setCellValue(v == null ? "" : v);
+    }
+
+    private static void writeNum(Row r, int i, Integer v) {
+        if (v == null) write(r, i, "");
+        else r.createCell(i, CellType.NUMERIC).setCellValue(v);
+    }
+
+    private static void writeBool(Row r, int i, Boolean v) {
+        write(r, i, v == null ? "" : (v ? "true" : "false"));
+    }
 
     // ========== SLUG HELPERS (série + autor) ==========
 
-    /** garante unicidade consultando o repo; se colidir, acrescenta sufixo estável curto (hash) */
+    /**
+     * garante unicidade consultando o repo; se colidir, acrescenta sufixo estável curto (hash)
+     */
     private String ensureUniqueSeriesSlug(String base) {
         if (!seriesRepo.existsBySlug(base)) return base;
         String suff = shortHash(base);
@@ -250,17 +273,17 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
     }
 
 
-
-
     private static String shortHash(String input) {
         try {
             MessageDigest md = MessageDigest.getInstance("SHA-1");
             byte[] d = md.digest(input.getBytes(StandardCharsets.UTF_8));
             // 8 hex chars é suficiente para diferenciar casos raros
             StringBuilder sb = new StringBuilder(8);
-            for (int i=0;i<4;i++) sb.append(String.format("%02x", d[i]));
+            for (int i = 0; i < 4; i++) sb.append(String.format("%02x", d[i]));
             return sb.toString();
-        } catch (Exception e) { return "x"; }
+        } catch (Exception e) {
+            return "x";
+        }
     }
 
     //----------------------
@@ -303,10 +326,10 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
     private static String slugify(String x) {
         if (x == null) return "";
         String s = java.text.Normalizer.normalize(x, java.text.Normalizer.Form.NFD)
-                .replaceAll("\\p{M}","")
+                .replaceAll("\\p{M}", "")
                 .toLowerCase(Locale.ROOT)
-                .replaceAll("[^a-z0-9]+","-")
-                .replaceAll("(^-|-$)","");
+                .replaceAll("[^a-z0-9]+", "-")
+                .replaceAll("(^-|-$)", "");
         return s;
     }
 
@@ -315,6 +338,29 @@ public class CatalogExcelServiceImpl implements CatalogExcelService {
         String t = s.trim();
         return t.isEmpty() ? null : t;
     }
-    // (demais helpers permanecem)
+
+    private static String strAny(Row r, Map<String,Integer> col, String... keys) {
+        for (String k : keys) {
+            Integer i = col.get(k);
+            if (i != null) {
+                Cell c = r.getCell(i);
+                if (c != null) {
+                    c.setCellType(CellType.STRING);
+                    String s = c.getStringCellValue();
+                    if (s != null && !s.trim().isEmpty()) return s.trim();
+                }
+            }
+        }
+        return null;
+    }
+
+    private static Boolean toBoolAny(Row r, Map<String,Integer> col, String... keys) {
+        for (String k : keys) {
+            Boolean v = toBool(r, col, k);
+            if (v != null) return v;
+        }
+        return null;
+    }
+
 
 }

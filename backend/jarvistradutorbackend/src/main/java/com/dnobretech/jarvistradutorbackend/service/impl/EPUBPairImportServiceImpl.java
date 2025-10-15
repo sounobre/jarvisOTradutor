@@ -1,131 +1,81 @@
 package com.dnobretech.jarvistradutorbackend.service.impl;
 
-import com.dnobretech.jarvistradutorbackend.dto.ExamplePair;
-import com.dnobretech.jarvistradutorbackend.dto.Pair;
-import com.dnobretech.jarvistradutorbackend.dto.Result;
+import com.dnobretech.jarvistradutorbackend.dto.*;
+import com.dnobretech.jarvistradutorbackend.epubimport.*;
 import com.dnobretech.jarvistradutorbackend.service.EPUBPairImportService;
 import com.dnobretech.jarvistradutorbackend.util.TextNormalizer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import nl.siegmann.epublib.domain.Book;
-import nl.siegmann.epublib.domain.Resource;
-import nl.siegmann.epublib.epub.EpubReader;
-import nl.siegmann.epublib.service.MediatypeService;
-import org.jsoup.Jsoup;
-import org.jsoup.nodes.Document;
-import org.jsoup.nodes.Element;
 import org.postgresql.copy.CopyManager;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
-import org.springframework.web.reactive.function.client.ExchangeStrategies;
-import org.springframework.web.reactive.function.client.WebClient;
 
 import javax.sql.DataSource;
 import java.io.*;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.sql.Connection;
-import java.util.*;
-import java.util.concurrent.atomic.AtomicReference;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class EPUBPairImportServiceImpl implements EPUBPairImportService {
 
-    private final DataSource dataSource;
-    private final TextNormalizer norm;
-    private final JdbcTemplate jdbc;
-
-    private final WebClient embClient = WebClient.builder()
-            .baseUrl("http://localhost:8001")
-            .exchangeStrategies(
-                    ExchangeStrategies.builder()
-                            .codecs(c -> c.defaultCodecs().maxInMemorySize(64 * 1024 * 1024)) // 64 MB
-                            .build()
-            )
-            .build();
-
+    // ===== Config =====
     @Value("${jarvis.tm.ratio-min:0.5}")
     private double ratioMin;
     @Value("${jarvis.tm.ratio-max:2.0}")
     private double ratioMax;
 
+    // ===== Deps (injetadas) =====
+    private final DataSource dataSource;
+    private final JdbcTemplate jdbc;
+    private final TextNormalizer norm;
+    private final EpubExtractor epubExtractor;
+    private final QualityFilter qualityFilter;
+    private final EmbeddingService embeddingService;
+    private final InboxWriter inboxWriter;
+    private final SchemaEnsurer schemaEnsurer;
+
+    // Aligners (nomeados com @Component("lengthAligner") / @Component("embeddingAligner"))
+    private final Aligner lengthAligner;
+    private final Aligner embeddingAligner;
+
+    // ===== Orquestração principal =====
     @Override
     public Result importParallelEPUB(MultipartFile fileEn,
                                      MultipartFile filePt,
-                                     String level,       // "paragraph"|"sentence"
-                                     String mode,        // "length"|"embedding"
+                                     String level,            // "paragraph" | "sentence"
+                                     String mode,             // "length" | "embedding"
                                      String srcLang,
                                      String tgtLang,
-                                     double minQuality,  // descarta abaixo
+                                     double minQuality,       // descarta abaixo
                                      Long seriesId,
                                      Long bookId,
-                                     String sourceTag   // descarta abaixo
-    ) throws Exception {
+                                     String sourceTag) throws Exception {
 
-        // 1) Extrair blocos dos EPUBs
-        List<String> blocksEn = extractBlocks(fileEn, level);
-        List<String> blocksPt = extractBlocks(filePt, level);
+        // 1) Extrair blocos com posição
+        List<Block> blocksEn = epubExtractor.extractBlocks(fileEn, level);
+        List<Block> blocksPt = epubExtractor.extractBlocks(filePt, level);
 
-        // 2) Alinhar (simples por tamanho; ou por embedding)
-        List<Pair> aligned = "embedding".equalsIgnoreCase(mode)
-                ? alignByEmbedding(blocksEn, blocksPt)
-                : alignByLength(blocksEn, blocksPt);
+        // 2) Alinhar (uma única vez, para AlignedPair)
+        Aligner aligner = "embedding".equalsIgnoreCase(mode) ? embeddingAligner : lengthAligner;
+        List<AlignedPair> aligned = aligner.align(blocksEn, blocksPt);
 
-        // 3) Preparar COPYs e schemas
-        ensureTmStagingSchema();              // garante staging + UNIQUE na tm
-        ensureTmOccurrenceStagingSchema();    // staging para ocorrências (série/livro/…)
-        boolean doEmb = "embedding".equalsIgnoreCase(mode); // (ou use flag embed=src|both)
+        // 3) COPY → STAGING (inbox) + (opcional) arquivo de embeddings
+        boolean doEmb = "embedding".equalsIgnoreCase(mode);
 
-        Connection conTm  = DataSourceUtils.getConnection(dataSource);
-        CopyManager cmTm  = conTm.unwrap(org.postgresql.PGConnection.class).getCopyAPI();
-
-        Connection conOcc = DataSourceUtils.getConnection(dataSource);
-        CopyManager cmOcc = conOcc.unwrap(org.postgresql.PGConnection.class).getCopyAPI();
-
-        // 3.1) COPY -> tm_staging (pipe)
-        final PipedReader pr = new PipedReader(1 << 16);
-        final PipedWriter pw = new PipedWriter(pr);
-        final AtomicReference<Throwable> copyErr = new AtomicReference<>();
-        Thread copyThread = new Thread(() -> {
-            try (Reader r = pr) {
-                cmTm.copyIn("COPY tm_staging(src,tgt,lang_src,lang_tgt,quality) FROM STDIN WITH (FORMAT csv, HEADER true)", r);
-            } catch (Throwable t) {
-                copyErr.set(t);
-                log.error("Erro COPY tm_staging (epub-pair)", t);
-            }
-        }, "copy-epub-tm-staging");
-        copyThread.start();
-
-        // 3.2) COPY -> tm_occurrence_staging (pipe)
-        final PipedReader prOcc = new PipedReader(1 << 16);
-        final PipedWriter pwOcc = new PipedWriter(prOcc);
-        final AtomicReference<Throwable> copyOccErr = new AtomicReference<>();
-        Thread copyOccThread = new Thread(() -> {
-            try (Reader r = prOcc) {
-                cmOcc.copyIn("""
-                            COPY tm_occurrence_staging
-                            (src,tgt,lang_src,lang_tgt,series_id,book_id,chapter,location,quality,source_tag)
-                            FROM STDIN WITH (FORMAT csv, HEADER true)
-                        """, r);
-            } catch (Throwable t) {
-                copyOccErr.set(t);
-                log.error("Erro COPY tm_occurrence_staging (epub-pair)", t);
-            }
-        }, "copy-epub-tm-occurrence");
-        copyOccThread.start();
-
-        // 3.3) Embeddings → arquivo temporário (evita travar pipe)
         File embTmpFile = null;
         BufferedWriter embFileWriter = null;
         if (doEmb) {
-            ensureEmbeddingsSchema();
-            embTmpFile = java.nio.file.Files.createTempFile("tm_emb_staging_", ".csv").toFile();
+            ensureBookpairEmbStagingSchema(); // cria tm_bookpair_emb_staging (vector(384))
+            embTmpFile = File.createTempFile("tm_bookpair_emb_", ".csv");
             embFileWriter = new BufferedWriter(
                     new OutputStreamWriter(new FileOutputStream(embTmpFile), StandardCharsets.UTF_8),
                     1 << 20
@@ -135,531 +85,188 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
 
         long inserted = 0, skipped = 0;
         double sumQ = 0.0;
-        int chapters = 1; // placeholder; se quiser, detecte via TOC
+        int chapters = 1; // placeholder
         List<ExamplePair> examples = new ArrayList<>(Math.min(10, aligned.size()));
 
-        try (BufferedWriter out = new BufferedWriter(pw, 1 << 16);
-             BufferedWriter outOcc = new BufferedWriter(pwOcc, 1 << 16)) {
+        final int BATCH = 512;
+        List<String> bufSrc = new ArrayList<>(BATCH);
+        List<String> bufTgt = new ArrayList<>(BATCH);
+        List<Double> bufQ  = new ArrayList<>(BATCH);
 
-            out.write("src,tgt,lang_src,lang_tgt,quality\n");
-            outOcc.write("src,tgt,lang_src,lang_tgt,series_id,book_id,chapter,location,quality,source_tag\n");
+        // Dedupe leve por (src,tgt,langs,location) dentro do lote
+        Set<String> seen = new HashSet<>(aligned.size() * 2);
 
-            final int BATCH = 512;
-            List<String> bufSrc = new ArrayList<>(BATCH);
-            List<String> bufTgt = new ArrayList<>(BATCH);
-            List<Double> bufQ = new ArrayList<>(BATCH);
+        try (InboxWriter.CopyCtx ctx = inboxWriter.openBookpairInboxStagingCopy()) {
+            Writer out = ctx.writer;
 
-            // dedupe leve por par (src,tgt,langs) dentro do lote
-            Set<String> seen = new HashSet<>(aligned.size() * 2);
+            for (AlignedPair ap : aligned) {
+                String src = norm.normalize(ap.src());
+                String tgt = norm.normalize(ap.tgt());
+                if (src.isBlank() || tgt.isBlank()) { skipped++; continue; }
 
-            for (Pair p : aligned) {
-                String src = norm.normalize(p.src());
-                String tgt = norm.normalize(p.tgt());
-                if (src.isBlank() || tgt.isBlank()) {
-                    skipped++;
-                    continue;
-                }
+                // posição do SRC (usaremos para chapter/location)
+                String chapter  = ap.srcPos().chapterTitle();
+                String location = posToLocation(ap.srcPos());
 
-                String key = src + "\u0001" + tgt + "\u0001" + srcLang + "\u0001" + tgtLang;
-                if (!seen.add(key)) {
-                    skipped++;
-                    continue;
-                }
+                String key = src + "\u0001" + tgt + "\u0001" + srcLang + "\u0001" + tgtLang + "\u0001" + location;
+                if (!seen.add(key)) { skipped++; continue; }
 
-                double r = norm.lengthRatio(src, tgt);
-                boolean ph = norm.placeholdersPreserved(src, tgt);
-                if (r < ratioMin || r > ratioMax || !ph) {
-                    skipped++;
-                    continue;
-                }
+                // qualidade
+                double r  = qualityFilter.lengthRatio(src, tgt);
+                boolean ph = qualityFilter.placeholdersPreserved(src, tgt);
+                if (r < ratioMin || r > ratioMax || !ph) { skipped++; continue; }
 
-                double q = qualityScore(r, ph);
-                if (q < minQuality) {
-                    skipped++;
-                    continue;
-                }
+                double q = qualityFilter.qualityScore(r, ph, ratioMin, ratioMax);
+                if (q < minQuality) { skipped++; continue; }
 
-                // 3.4) escreve na STAGING textual (pipe tm_staging)
-                writeCsvLine(out, src, tgt, srcLang, tgtLang, String.valueOf(q));
-
-                // 3.5) escreve ocorrência (pipe tm_occurrence_staging)
-                // chapter/location podem ser null aqui; preencha se você tiver essa info
-                writeOccCsvLine(outOcc, src, tgt, srcLang, tgtLang, seriesId, bookId, null, null, q, sourceTag);
+                // 3.1) CSV → staging do inbox (agora inclui chapter/location)
+                writeBookpairInboxCsvLine(
+                        out,
+                        src, tgt, srcLang, tgtLang, q,
+                        seriesId, bookId,
+                        chapter, location,
+                        sourceTag
+                );
 
                 inserted++;
                 sumQ += q;
                 if (examples.size() < 10) examples.add(new ExamplePair(src, tgt, q));
 
+                // 3.2) Embeddings → arquivo temporário
                 if (doEmb) {
                     bufSrc.add(src);
                     bufTgt.add(tgt);
                     bufQ.add(q);
                     if (bufSrc.size() >= BATCH) {
-                        flushEmbeddingsBufferToFile(embFileWriter, bufSrc, bufTgt, srcLang, tgtLang, bufQ, /*both*/ true);
+                        embeddingService.flushEmbeddingsToFile(embFileWriter, bufSrc, bufTgt, srcLang, tgtLang, bufQ, true);
                     }
                 }
             }
+
             if (doEmb && !bufSrc.isEmpty()) {
-                flushEmbeddingsBufferToFile(embFileWriter, bufSrc, bufTgt, srcLang, tgtLang, bufQ, /*both*/ true);
+                embeddingService.flushEmbeddingsToFile(embFileWriter, bufSrc, bufTgt, srcLang, tgtLang, bufQ, true);
             }
-
-            out.flush();
-            outOcc.flush();
-            if (doEmb) embFileWriter.flush();
-
         } finally {
-            // sinaliza EOF ao COPY textual
-            try {
-                pw.close();
-            } catch (IOException ignore) {
-            }
-            try {
-                pwOcc.close();
-            } catch (IOException ignore) {
-            }
-
-            // aguarda COPYs drenarem
-            try {
-                copyThread.join(120_000);
-            } catch (InterruptedException ignore) {
-            }
-            try {
-                copyOccThread.join(120_000);
-            } catch (InterruptedException ignore) {
-            }
-
-            DataSourceUtils.releaseConnection(conTm, dataSource);
-            DataSourceUtils.releaseConnection(conOcc, dataSource);
-
-            // fecha arquivo embeddings
             if (embFileWriter != null) {
-                try {
-                    embFileWriter.close();
-                } catch (IOException ignore) {
-                }
+                try { embFileWriter.close(); } catch (IOException ignore) {}
             }
         }
 
-        // checa erros dos COPYs
-        if (copyErr.get() != null) throw new RuntimeException("COPY tm_staging falhou (epub-pair)", copyErr.get());
-        if (copyOccErr.get() != null)
-            throw new RuntimeException("COPY tm_occurrence_staging falhou (epub-pair)", copyOccErr.get());
+        // 4) Consolidar STAGING → INBOX (UPSERT seguro)
+        int merged = inboxWriter.mergeBookpairInboxFromStaging(jdbc);
+        log.info("[epub-pair] merged into tm_bookpair_inbox = {}", merged);
 
-        // 4) Consolidar staging → tm (idempotente, sem duplicatas)
-        int up = upsertFromTmStagingToTm();
-        log.info("[epub-pair] staging→tm upserts/updates={}", up);
-        truncateTmStaging(); // opcional
-
-        // 5) Consolidar occurrences staging → tm_occurrence
-        int occ = upsertFromOccurrenceStagingToOccurrence();
-        log.info("[epub-pair] tm_occurrence inseridos={}", occ);
-
-        // 6) Consolidar embeddings staging → tm_embeddings (1 por tm_id)
-        if (doEmb) {
-            // COPY do arquivo temporário para tm_emb_staging
+        // 5) Se geramos embeddings, COPY do arquivo temporário → tm_bookpair_emb_staging
+        if (doEmb && embTmpFile != null && embTmpFile.exists()) {
             try (Connection con2 = DataSourceUtils.getConnection(dataSource)) {
                 CopyManager cm2 = con2.unwrap(org.postgresql.PGConnection.class).getCopyAPI();
                 try (Reader r = new BufferedReader(
                         new InputStreamReader(new FileInputStream(embTmpFile), StandardCharsets.UTF_8),
                         1 << 20)) {
                     cm2.copyIn("""
-                                COPY tm_emb_staging(src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality)
-                                FROM STDIN WITH (FORMAT csv, HEADER true)
-                            """, r);
+                    COPY tm_bookpair_emb_staging(src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality)
+                    FROM STDIN WITH (FORMAT csv, HEADER true)
+                """, r);
                 }
             } finally {
-                if (embTmpFile != null && embTmpFile.exists() && !embTmpFile.delete()) {
+                if (!embTmpFile.delete()) {
                     log.warn("Arquivo temporário não foi deletado: {}", embTmpFile.getAbsolutePath());
                 }
             }
+        }
 
-            int merged = consolidateEmbeddingsFromStaging();
-            log.info("[epub-pair] Embeddings consolidados: {}", merged);
+        // 6) Marca o livro como “pares importados”
+        if (bookId != null && merged > 0) {
+            int upd = jdbc.update("""
+            UPDATE book
+               SET pairs_imported = TRUE,
+                   updated_at     = now()
+             WHERE id = ?
+        """, bookId);
+            log.info("[epub-pair] book {} marcado como pairs_imported=TRUE (upd={})", bookId, upd);
         }
 
         double avgQ = inserted > 0 ? (sumQ / inserted) : 0.0;
-        //int chapters = 1; // ajuste se você extrair capítulos
         return new Result(inserted, skipped, avgQ, chapters, examples);
     }
 
-
-    // ===================== Alinhamento =====================
-
-    private List<Pair> alignByLength(List<String> en, List<String> pt) {
-        int n = Math.min(en.size(), pt.size());
-        List<Pair> out = new ArrayList<>(n);
-        for (int i = 0; i < n; i++) out.add(new Pair(en.get(i), pt.get(i)));
-        return out;
+    // helper para serializar a posição
+    private static String posToLocation(Block p) {
+        return "spine=" + p.spineIdx() + ";block=" + p.blockIdx() + ";sent=" + p.sentIdx();
     }
 
-    private List<Pair> alignByEmbedding(List<String> en, List<String> pt) {
-        log.info("entrando em alignByEmbedding");
-        final int N = en.size(), M = pt.size();
-        final int BATCH = 128;
-        List<Pair> pairs = new ArrayList<>(Math.min(N, M));
 
-        // embeda PT uma vez (poderia cachear)
-        var vPt = embedTexts(pt, true);
-
-        for (int i = 0; i < N; i += BATCH) {
-            log.info("for (int i = 0; i < N; i += BATCH) { : \ni = " + i + "\nN = " + N + "\nBATCH = " + BATCH );
-            int i2 = Math.min(i + BATCH, N);
-            var enBatch = en.subList(i, i2);
-            var vEn = embedTexts(enBatch, true);
-
-            for (int a = 0; a < enBatch.size(); a++) {
-                log.info("for (int a = 0; a < enBatch.size(); a++) { \na = " + a + "\nenBatch.size() = " + enBatch.size());
-                int bestJ = -1; double best = -1.0;
-                double[] ve = vEn.get(a);
-                for (int j = 0; j < M; j++) {
-                    double sim = cosine(ve, vPt.get(j));
-                    if (sim > best) { best = sim; bestJ = j; }
-                }
-                if (bestJ >= 0) pairs.add(new Pair(enBatch.get(a), pt.get(bestJ)));
-            }
+    // ===== Helpers de IO CSV (escrita de uma linha do inbox staging) =====
+    private static void writeBookpairInboxCsvLine(
+            Writer w,
+            String src, String tgt,
+            String langSrc, String langTgt,
+            Double quality,
+            Long seriesId, Long bookId,
+            String chapter, String location,
+            String sourceTag
+    ) throws IOException {
+        w.write('"');
+        w.write(esc(src));
+        w.write('"');
+        w.write(',');
+        w.write('"');
+        w.write(esc(tgt));
+        w.write('"');
+        w.write(',');
+        w.write('"');
+        w.write(esc(langSrc));
+        w.write('"');
+        w.write(',');
+        w.write('"');
+        w.write(esc(langTgt));
+        w.write('"');
+        w.write(',');
+        if (quality != null) w.write(Double.toString(quality));
+        w.write(',');
+        if (seriesId != null) w.write(seriesId.toString());
+        w.write(',');
+        if (bookId != null) w.write(bookId.toString());
+        w.write(',');
+        if (chapter != null && !chapter.isBlank()) {
+            w.write('"');
+            w.write(esc(chapter));
+            w.write('"');
         }
-        return pairs;
-    }
-
-    // ===================== Embeddings helpers =====================
-
-    private List<double[]> embedTexts(List<String> texts, boolean normalize) {
-        if (texts.isEmpty()) return List.of();
-        var payload = Map.of("texts", texts, "normalize", normalize);
-        var resp = embClient.post().uri("/embed")
-                .bodyValue(payload)
-                .retrieve()
-                .bodyToMono(com.dnobretech.jarvistradutorbackend.dto.EmbedResponse.class)
-                .block();
-        return (resp != null && resp.vectors() != null) ? resp.vectors() : List.of();
-    }
-
-    private static String toVectorLiteral(double[] v) {
-        StringBuilder sb = new StringBuilder();
-        sb.append('[');
-        for (int i = 0; i < v.length; i++) {
-            if (i > 0) sb.append(',');
-            sb.append(Double.toString(v[i]));
+        w.write(',');
+        if (location != null && !location.isBlank()) {
+            w.write('"');
+            w.write(esc(location));
+            w.write('"');
         }
-        sb.append(']');
-        return sb.toString();
-    }
-
-    // grava embeddings no **arquivo temporário** (sem pipe)
-    private void flushEmbeddingsBufferToFile(Writer outEmbFile,
-                                             List<String> bufSrc,
-                                             List<String> bufTgt,
-                                             String srcLang, String tgtLang,
-                                             List<Double> bufQ,
-                                             boolean both) throws IOException {
-
-        var vecSrc = embedTexts(bufSrc, true);
-        var vecTgt = both ? embedTexts(bufTgt, true) : List.<double[]>of();
-
-        for (int i = 0; i < bufSrc.size(); i++) {
-            log.info("for (int i = 0; i < bufSrc.size(); i++) { \ni = " + i + "\nbufSrc.size()" + bufSrc.size());
-            String src = bufSrc.get(i);
-            String tgt = bufTgt.get(i);
-            String embSrc = toVectorLiteral(vecSrc.get(i));
-            String embTgt = both ? toVectorLiteral(vecTgt.get(i)) : "";
-
-            StringBuilder sb = new StringBuilder(8192);
-            sb.append('"').append(esc(src)).append('"').append(',');
-            sb.append('"').append(esc(tgt)).append('"').append(',');
-            sb.append('"').append(esc(srcLang)).append('"').append(',');
-            sb.append('"').append(esc(tgtLang)).append('"').append(',');
-            if (!embSrc.isEmpty()) sb.append('"').append(embSrc).append('"');
-            sb.append(',');
-            if (!embTgt.isEmpty()) sb.append('"').append(embTgt).append('"');
-            sb.append(',');
-            sb.append(bufQ.get(i)).append('\n');
-
-            outEmbFile.write(sb.toString());
+        w.write(',');
+        if (sourceTag != null && !sourceTag.isBlank()) {
+            w.write('"');
+            w.write(esc(sourceTag));
+            w.write('"');
         }
-
-        // flush leve por lote (bom para monitorar, sem travar)
-        outEmbFile.flush();
-
-        bufSrc.clear(); bufTgt.clear(); bufQ.clear();
-    }
-
-    // ===================== IO/CSV/Qualidade =====================
-
-    private static void writeCsvLine(Writer out, String src, String tgt, String langSrc, String langTgt, String quality) throws IOException {
-        out.write('"'); out.write(esc(src)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(tgt)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(langSrc)); out.write('"'); out.write(',');
-        out.write('"'); out.write(esc(langTgt)); out.write('"'); out.write(',');
-        if (quality != null && !quality.isBlank()) out.write(quality);
-        out.write('\n');
-    }
-
-    private double qualityScore(double r, boolean placeholdersOk) {
-        double rs;
-        if (r <= ratioMin || r >= ratioMax) rs = 0.0;
-        else if (r <= 1.0) rs = 1.0 - ((1.0 - r) / (1.0 - ratioMin));
-        else rs = 1.0 - ((r - 1.0) / (ratioMax - 1.0));
-        rs = Math.max(0.0, Math.min(1.0, rs));
-        double ps = placeholdersOk ? 1.0 : 0.0;
-        double q = 0.7 * rs + 0.3 * ps;
-        return Math.round(q * 1000.0) / 1000.0;
+        w.write('\n');
     }
 
     private static String esc(String s) {
         return s.replace("\"", "\"\"");
     }
 
-    private static double cosine(double[] a, double[] b) {
-        double dot=0, na=0, nb=0;
-        for (int i=0;i<a.length;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; }
-        double denom = Math.sqrt(na)*Math.sqrt(nb);
-        return denom==0 ? 0 : dot/denom;
-    }
-
-    // ===================== Schema & Consolidação =====================
-
-    private void ensureTmStagingSchema() {
+    // ===== Esquema de staging de embeddings (book-pair) =====
+    private void ensureBookpairEmbStagingSchema() {
         jdbc.execute("""
-      CREATE TABLE IF NOT EXISTS tm_staging (
-        src       text NOT NULL,
-        tgt       text NOT NULL,
-        lang_src  text NOT NULL,
-        lang_tgt  text NOT NULL,
-        quality   double precision,
-        created_at timestamp default now()
-      )
-    """);
-
-        // Em versões que não suportam ADD CONSTRAINT IF NOT EXISTS, use DO $$ ... $$
-        jdbc.execute("""
-      DO $$
-      BEGIN
-        IF NOT EXISTS (
-          SELECT 1
-          FROM pg_constraint
-          WHERE conname = 'tm_unique_pair'
-            AND conrelid = 'tm'::regclass
-        ) THEN
-          ALTER TABLE tm
-            ADD CONSTRAINT tm_unique_pair
-            UNIQUE (src, tgt, lang_src, lang_tgt);
-        END IF;
-      END
-      $$;
-    """);
+                  CREATE TABLE IF NOT EXISTS tm_bookpair_emb_staging (
+                    src       text NOT NULL,
+                    tgt       text NOT NULL,
+                    lang_src  text NOT NULL,
+                    lang_tgt  text NOT NULL,
+                    emb_src   vector(384),
+                    emb_tgt   vector(384),
+                    quality   double precision,
+                    created_at timestamp default now()
+                  )
+                """);
     }
-
-    private int upsertFromTmStagingToTm() {
-        ensureTmStagingSchema();
-        String sql = """
-        WITH dedup AS (
-          SELECT
-            src, tgt, lang_src, lang_tgt,
-            MAX(quality) AS quality
-          FROM tm_staging
-          GROUP BY src, tgt, lang_src, lang_tgt
-        )
-        INSERT INTO tm (src, tgt, lang_src, lang_tgt, quality)
-        SELECT src, tgt, lang_src, lang_tgt, quality
-        FROM dedup
-        ON CONFLICT (src, tgt, lang_src, lang_tgt)
-        DO UPDATE SET quality = GREATEST(EXCLUDED.quality, tm.quality)
-    """;
-        return jdbc.update(sql);
-    }
-
-    private void truncateTmStaging() {
-        jdbc.execute("TRUNCATE tm_staging");
-    }
-
-    private void ensureEmbeddingsSchema() {
-        jdbc.execute("""
-            CREATE TABLE IF NOT EXISTS tm_emb_staging (
-              src       text NOT NULL,
-              tgt       text NOT NULL,
-              lang_src  text NOT NULL,
-              lang_tgt  text NOT NULL,
-              emb_src   vector,
-              emb_tgt   vector,
-              quality   double precision,
-              created_at timestamp default now()
-            )
-        """);
-        jdbc.execute("CREATE TABLE IF NOT EXISTS tm_embeddings (tm_id bigint PRIMARY KEY)");
-        jdbc.execute("ALTER TABLE tm_embeddings ADD COLUMN IF NOT EXISTS emb_src vector");
-        jdbc.execute("ALTER TABLE tm_embeddings ADD COLUMN IF NOT EXISTS emb_tgt vector");
-    }
-
-    // Usa ROW_NUMBER para garantir uma linha por tm_id no mesmo comando
-    private int consolidateEmbeddingsFromStaging() {
-        String sql = """
-          WITH ranked AS (
-            SELECT
-              t.id AS tm_id, s.emb_src, s.emb_tgt, s.quality,
-              ROW_NUMBER() OVER (
-                PARTITION BY t.id
-                ORDER BY s.quality DESC NULLS LAST
-              ) rn
-            FROM tm t
-            JOIN tm_emb_staging s
-              ON t.src = s.src
-             AND t.tgt = s.tgt
-             AND t.lang_src = s.lang_src
-             AND t.lang_tgt = s.lang_tgt
-          )
-          INSERT INTO tm_embeddings (tm_id, emb_src, emb_tgt)
-          SELECT tm_id, emb_src, emb_tgt
-          FROM ranked WHERE rn = 1
-          ON CONFLICT (tm_id) DO UPDATE
-          SET emb_src = EXCLUDED.emb_src,
-              emb_tgt = COALESCE(EXCLUDED.emb_tgt, tm_embeddings.emb_tgt)
-        """;
-        return jdbc.update(sql);
-    }
-
-    // ===================== Parsing EPUB =====================
-
-    private List<String> extractBlocks(MultipartFile file, String level) throws Exception {
-        Book book;
-        try (InputStream in = file.getInputStream()) {
-            book = new EpubReader().readEpub(in);
-        }
-
-        List<String> blocks = new ArrayList<>();
-
-        for (Resource res : book.getContents()) {
-            if (res.getMediaType() == MediatypeService.XHTML) {
-                Charset enc = res.getInputEncoding() != null
-                        ? Charset.forName(res.getInputEncoding())
-                        : StandardCharsets.UTF_8;
-                String html = new String(res.getData(), enc);
-                blocks.addAll(htmlToBlocks(html, level));
-            }
-        }
-
-        return postProcessBlocks(blocks);
-    }
-
-    private List<String> htmlToBlocks(String html, String level) {
-        Document doc = Jsoup.parse(html);
-
-        List<String> out = new ArrayList<>();
-        for (Element el : doc.select("p, li")) {
-            String t = clean(el.text());
-            if (!t.isBlank()) out.add(t);
-        }
-        for (Element el : doc.select("div:not(:has(p,li))")) {
-            String t = clean(el.text());
-            if (!t.isBlank()) out.add(t);
-        }
-
-        if ("sentence".equalsIgnoreCase(level)) {
-            List<String> sent = new ArrayList<>();
-            for (String p : out) {
-                for (String s : p.split("(?<=[.!?…])\\s+")) {
-                    s = s.trim();
-                    if (!s.isBlank()) sent.add(s);
-                }
-            }
-            return sent;
-        }
-
-        return out;
-    }
-
-    private String clean(String s) {
-        s = s.replaceAll("\\s+", " ").trim();
-        return s;
-    }
-
-    private List<String> postProcessBlocks(List<String> in) {
-        List<String> tmp = new ArrayList<>(in.size());
-        String prev = null;
-        for (String s : in) {
-            if (!s.equals(prev)) tmp.add(s);
-            prev = s;
-        }
-        List<String> out = new ArrayList<>(tmp.size());
-        for (String s : tmp) {
-            String noDigits = s.replaceAll("\\d", "");
-            boolean looksFooter = s.length() <= 5 || noDigits.isBlank();
-            if (!looksFooter) out.add(s);
-        }
-        LinkedHashSet<String> seen = new LinkedHashSet<>(out);
-        return new ArrayList<>(seen);
-    }
-
-private void ensureTmOccurrenceStagingSchema() {
-    jdbc.execute("""
-        CREATE TABLE IF NOT EXISTS tm_occurrence_staging (
-          src        text NOT NULL,
-          tgt        text NOT NULL,
-          lang_src   text NOT NULL,
-          lang_tgt   text NOT NULL,
-          series_id  bigint,
-          book_id    bigint,
-          chapter    text,
-          location   text,
-          quality    double precision,
-          source_tag text,
-          created_at timestamp default now()
-        )
-    """);
-}
-
-/** Move ocorrências do staging para a tabela final, resolvendo tm_id por (src,tgt,langs). */
-private int upsertFromOccurrenceStagingToOccurrence() {
-    String sql = """
-        INSERT INTO tm_occurrence (tm_id, series_id, book_id, chapter, location, quality_at_import, source_tag)
-        SELECT t.id, s.series_id, s.book_id, s.chapter, s.location, s.quality, s.source_tag
-          FROM tm_occurrence_staging s
-          JOIN tm t
-            ON t.src = s.src
-           AND t.tgt = s.tgt
-           AND t.lang_src = s.lang_src
-           AND t.lang_tgt = s.lang_tgt
-    """;
-    int inserted = jdbc.update(sql);
-    jdbc.execute("TRUNCATE tm_occurrence_staging");
-    return inserted;
-}
-
-/** Escreve uma linha CSV para tm_occurrence_staging. */
-private static void writeOccCsvLine(Writer w,
-                                    String src, String tgt,
-                                    String langSrc, String langTgt,
-                                    Long seriesId, Long bookId,
-                                    String chapter, String location,
-                                    double quality, String sourceTag) throws IOException {
-    // src
-    w.write('"'); w.write(esc(src)); w.write('"'); w.write(',');
-    // tgt
-    w.write('"');
-    w.write(esc(tgt));
-    w.write('"');
-    w.write(',');
-    // lang_src
-    w.write('"'); w.write(esc(langSrc)); w.write('"'); w.write(',');
-    // lang_tgt
-    w.write('"'); w.write(esc(langTgt)); w.write('"'); w.write(',');
-    // series_id
-    if (seriesId != null) w.write(seriesId.toString());
-    w.write(',');
-    // book_id
-    if (bookId != null) w.write(bookId.toString());
-    w.write(',');
-    // chapter
-    if (chapter != null && !chapter.isBlank()) { w.write('"'); w.write(esc(chapter)); w.write('"'); }
-    w.write(',');
-    // location
-    if (location != null && !location.isBlank()) { w.write('"'); w.write(esc(location)); w.write('"'); }
-    w.write(',');
-    // quality
-    w.write(Double.toString(quality)); w.write(',');
-    // source_tag
-    if (sourceTag != null && !sourceTag.isBlank()) { w.write('"'); w.write(esc(sourceTag)); w.write('"'); }
-    w.write('\n');
-}
 
 
 }
