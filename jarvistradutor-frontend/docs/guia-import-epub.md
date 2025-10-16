@@ -221,3 +221,26 @@ jarvis:
 ---
 
 **Pronto!** Cole esse `.md` no repositório (ex.: `docs/guia-import-epub.md`) e compartilhe com a equipe.
+
+
+
+Como configurar (application.yml)
+````
+jarvis:
+  align:
+    embedding:
+      window: 12           # janela base
+      threshold: 0.85      # similaridade mínima
+      windowBackoff: 8     # quanto ampliar por passo, se não achar match
+      maxBackoffSteps: 2   # quantos passos de ampliação
+      batch: 128
+````
+
+Se notar muitos descartes, abaixe threshold (ex.: 0.82) ou aumente window/windowBackoff.
+Se notar “matchs cruzados”, aumente threshold e/ou reduza window.
+
+Dicas:
+
+Use MIN_SIM (por ex. 0.70) para descartar pareamentos fracos.
+
+Se os livros forem longos, considere janela/banda (processar por capítulos ou blocos de 300–500 frases) para reduzir O(N³).

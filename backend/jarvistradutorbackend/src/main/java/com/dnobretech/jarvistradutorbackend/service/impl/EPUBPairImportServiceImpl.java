@@ -7,6 +7,7 @@ import com.dnobretech.jarvistradutorbackend.util.TextNormalizer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.postgresql.copy.CopyManager;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.datasource.DataSourceUtils;
@@ -24,7 +25,6 @@ import java.util.Set;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class EPUBPairImportServiceImpl implements EPUBPairImportService {
 
     // ===== Config =====
@@ -45,7 +45,23 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
 
     // Aligners (nomeados com @Component("lengthAligner") / @Component("embeddingAligner"))
     private final Aligner lengthAligner;
-    private final Aligner embeddingAligner;
+    private final Aligner embeddingAlignerHungarian;
+
+    public EPUBPairImportServiceImpl(
+            DataSource dataSource, JdbcTemplate jdbc, TextNormalizer norm, EpubExtractor epubExtractor, QualityFilter qualityFilter, EmbeddingService embeddingService, InboxWriter inboxWriter, SchemaEnsurer schemaEnsurer, @Qualifier("lengthAligner") Aligner lengthAligner,
+            @Qualifier("embeddingAlignerHungarian") Aligner embeddingAlignerHungarian
+            /* demais deps… */) {
+        this.dataSource = dataSource;
+        this.jdbc = jdbc;
+        this.norm = norm;
+        this.epubExtractor = epubExtractor;
+        this.qualityFilter = qualityFilter;
+        this.embeddingService = embeddingService;
+        this.inboxWriter = inboxWriter;
+        this.schemaEnsurer = schemaEnsurer;
+        this.lengthAligner = lengthAligner;
+        this.embeddingAlignerHungarian = embeddingAlignerHungarian;
+    }
 
     // ===== Orquestração principal =====
     @Override
@@ -65,7 +81,9 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
         List<Block> blocksPt = epubExtractor.extractBlocks(filePt, level);
 
         // 2) Alinhar (uma única vez, para AlignedPair)
-        Aligner aligner = "embedding".equalsIgnoreCase(mode) ? embeddingAligner : lengthAligner;
+        Aligner aligner = "embedding".equalsIgnoreCase(mode)
+                ? embeddingAlignerHungarian
+                : lengthAligner;
         List<AlignedPair> aligned = aligner.align(blocksEn, blocksPt);
 
         // 3) COPY → STAGING (inbox) + (opcional) arquivo de embeddings

@@ -9,3 +9,7 @@ pydantic==2.8.2
 pydantic-settings==2.4.0
 redis==5.0.8           # opcional, se usar cache externo
 pymongo>=4.7,<5
+unbabel-comet>=2.2.2
+sacrebleu>=2.4
+unbabel-comet>=2.2.3,<3.0.0
+torch>=2.1.0; platform_system != "Windows"  # ajuste conforme seu ambiente
