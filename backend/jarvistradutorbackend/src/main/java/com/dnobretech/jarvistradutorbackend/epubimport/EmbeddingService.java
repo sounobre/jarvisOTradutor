@@ -23,12 +23,16 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class EmbeddingService {
 
-    /** Tamanho do lote para evitar estouro do buffer de 64MB. Ajuste via application.yml se quiser. */
+    /**
+     * Tamanho do lote para evitar estouro do buffer de 64MB. Ajuste via application.yml se quiser.
+     */
     @Value("${jarvis.embed.batch-size:256}")
     private int batchSize;
 
-    /** Timeout por chamada ao /embed (segundos). */
-    @Value("${jarvis.embed.timeout-seconds:60}")
+    /**
+     * Timeout por chamada ao /embed (segundos).
+     */
+    @Value("${jarvis.embeddings.timeout-seconds:60}")
     private long timeoutSeconds;
 
     private final WebClient embClient = WebClient.builder()
@@ -42,12 +46,19 @@ public class EmbeddingService {
                     .build())
             .build();
 
-    /** Assinatura preservada. Agora faz batching internamente. */
+    /**
+     * Assinatura preservada. Agora faz batching internamente.
+     */
     public List<double[]> embedTexts(List<String> texts, boolean normalize) {
-        return embedTextsBatched(texts, normalize, Math.max(1, batchSize));
+        log.info("Entrando no EmbeddingService: \n");
+        List<double[]> out = embedTextsBatched(texts, normalize, Math.max(1, batchSize));
+        log.info("Saindo do EmbeddingService: \n");
+        return out;
     }
 
-    /** Faz várias chamadas ao /embed em fatias e concatena o resultado. */
+    /**
+     * Faz várias chamadas ao /embed em fatias e concatena o resultado.
+     */
     private List<double[]> embedTextsBatched(List<String> texts, boolean normalize, int batch) {
         List<double[]> out = new ArrayList<>(texts.size());
         if (texts == null || texts.isEmpty()) return out;
@@ -75,7 +86,9 @@ public class EmbeddingService {
         return out;
     }
 
-    /** Assinatura preservada — usada por quem grava CSV com embeddings. */
+    /**
+     * Assinatura preservada — usada por quem grava CSV com embeddings.
+     */
     public void flushEmbeddingsToFile(Writer outEmbFile,
                                       List<String> bufSrc,
                                       List<String> bufTgt,
@@ -106,11 +119,15 @@ public class EmbeddingService {
             outEmbFile.write(sb.toString());
         }
         outEmbFile.flush();
-        bufSrc.clear(); bufTgt.clear(); bufQ.clear();
+        bufSrc.clear();
+        bufTgt.clear();
+        bufQ.clear();
     }
 
     // ===== helpers (iguais aos seus) =====
-    private static String esc(String s) { return s.replace("\"", "\"\""); }
+    private static String esc(String s) {
+        return s.replace("\"", "\"\"");
+    }
 
     private static String toVectorLiteral(double[] v) {
         StringBuilder sb = new StringBuilder();

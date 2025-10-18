@@ -1,10 +1,16 @@
 server:
   port: 8080
+  tomcat:
+    accesslog:
+      enabled: true
+      pattern: '%h %l %u %t "%r" %s %b "%{Referer}i" "%{User-Agent}i"'
+  address: 127.0.0.1
 spring:
   servlet:
     multipart:
       max-file-size: 200000MB
       max-request-size: 200000MB
+
 
   # PostgreSQL
   datasource:
@@ -40,10 +46,25 @@ jarvis:
     model: paraphrase-multilingual-MiniLM-L12-v2         # só informativo aqui
     batch-size: 256
     dimension: 384
+    timeout-seconds: 60
+    only-approved: false
   tm:
     cosine-threshold: 0.86                               # limiar de aceitação
     ratio-min: 0.5                                       # filtros de qualidade para import
     ratio-max: 2.0
+  qe:
+    timeout-seconds: 90
+  bt:
+    timeout-seconds: 120
+  aligner:
+    mode: embedding      # default
+    window-size: 10
+  scoring:
+    good-min: 0.80          # final_score ≥ 0.80 ⇒ good (se QE bom)
+    suspect-min: 0.55            # final_score ≥ 0.55 ⇒ pelo menos suspect/pending
+    qe-good-min: 0.75             # qe_score ≥ 0.75 para chamar de good
 
   glossary:
     embed-mode: both        # none|src|both
+
+

@@ -25,26 +25,32 @@ public class SchemaEnsurer {
     /** Tabela final (inbox) sem UNIQUE por expressão — vamos consolidar via MERGE. */
     public void ensureBookpairInbox() {
         jdbc.execute("""
-            CREATE TABLE IF NOT EXISTS tm_bookpair_inbox (
-              id          bigserial PRIMARY KEY,
-              src         text NOT NULL,
-              tgt         text NOT NULL,
-              lang_src    text NOT NULL,
-              lang_tgt    text NOT NULL,
-              quality     double precision,
-              series_id   bigint,
-              book_id     bigint,
-              chapter     text,
-              location    text,
-              source_tag  text,
-              status      text NOT NULL DEFAULT 'pending',  -- pending|approved|rejected
-              reviewer    text,
-              reviewed_at timestamp,
-              created_at  timestamp DEFAULT now()
-            )
-        """);
+        CREATE TABLE IF NOT EXISTS tm_bookpair_inbox (
+          id          bigserial PRIMARY KEY,
+          src         text NOT NULL,
+          tgt         text NOT NULL,
+          lang_src    text NOT NULL,
+          lang_tgt    text NOT NULL,
+          quality     double precision,
+          series_id   bigint,
+          book_id     bigint,
+          chapter     text,
+          location    text,
+          source_tag  text,
+          qe_score    double precision,  -- NEW
+          bt_chrf     double precision,  -- NEW (0..100)
+          final_score double precision,  -- NEW (0..1)
+          status      text NOT NULL DEFAULT 'pending',
+          reviewer    text,
+          reviewed_at timestamp,
+          created_at  timestamp DEFAULT now()
+        )
+    """);
+        // se já existia, garante as colunas:
+        jdbc.execute("ALTER TABLE tm_bookpair_inbox ADD COLUMN IF NOT EXISTS qe_score double precision");
+        jdbc.execute("ALTER TABLE tm_bookpair_inbox ADD COLUMN IF NOT EXISTS bt_chrf double precision");
+        jdbc.execute("ALTER TABLE tm_bookpair_inbox ADD COLUMN IF NOT EXISTS final_score double precision");
 
-        // índices úteis para filtros comuns
         jdbc.execute("CREATE INDEX IF NOT EXISTS idx_bpinbox_status      ON tm_bookpair_inbox(status)");
         jdbc.execute("CREATE INDEX IF NOT EXISTS idx_bpinbox_series      ON tm_bookpair_inbox(series_id)");
         jdbc.execute("CREATE INDEX IF NOT EXISTS idx_bpinbox_book        ON tm_bookpair_inbox(book_id)");
@@ -52,23 +58,30 @@ public class SchemaEnsurer {
         jdbc.execute("CREATE INDEX IF NOT EXISTS idx_bpinbox_created_at  ON tm_bookpair_inbox(created_at DESC)");
     }
 
-    /** Staging textual para COPY. */
     public void ensureBookpairInboxStaging() {
         jdbc.execute("""
-            CREATE TABLE IF NOT EXISTS tm_bookpair_inbox_staging (
-              src         text NOT NULL,
-              tgt         text NOT NULL,
-              lang_src    text NOT NULL,
-              lang_tgt    text NOT NULL,
-              quality     double precision,
-              series_id   bigint,
-              book_id     bigint,
-              chapter     text,
-              location    text,
-              source_tag  text,
-              created_at  timestamp DEFAULT now()
-            )
-        """);
+        CREATE TABLE IF NOT EXISTS tm_bookpair_inbox_staging (
+          src         text NOT NULL,
+          tgt         text NOT NULL,
+          lang_src    text NOT NULL,
+          lang_tgt    text NOT NULL,
+          quality     double precision,
+          series_id   bigint,
+          book_id     bigint,
+          chapter     text,
+          location    text,
+          source_tag  text,
+          qe_score    double precision,  -- NEW
+          bt_chrf     double precision,  -- NEW
+          final_score double precision,  -- NEW
+          created_at  timestamp DEFAULT now()
+        )
+    """);
+        // se já existia, garante as colunas:
+        jdbc.execute("ALTER TABLE tm_bookpair_inbox_staging ADD COLUMN IF NOT EXISTS qe_score double precision");
+        jdbc.execute("ALTER TABLE tm_bookpair_inbox_staging ADD COLUMN IF NOT EXISTS bt_chrf double precision");
+        jdbc.execute("ALTER TABLE tm_bookpair_inbox_staging ADD COLUMN IF NOT EXISTS final_score double precision");
+
         jdbc.execute("TRUNCATE tm_bookpair_inbox_staging");
     }
 

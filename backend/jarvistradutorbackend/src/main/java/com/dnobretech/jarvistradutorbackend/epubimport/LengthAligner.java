@@ -20,7 +20,8 @@ public class LengthAligner implements Aligner {
         for (int i=0;i<n;i++) {
             out.add(new AlignedPair(
                     src.get(i).text(), src.get(i),
-                    tgt.get(i).text(), tgt.get(i)
+                    tgt.get(i).text(), tgt.get(i),
+                     0.0
             ));
         }
         return out;

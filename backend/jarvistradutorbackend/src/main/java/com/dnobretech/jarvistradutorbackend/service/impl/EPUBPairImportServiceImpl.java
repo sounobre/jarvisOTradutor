@@ -1,10 +1,13 @@
 package com.dnobretech.jarvistradutorbackend.service.impl;
 
-import com.dnobretech.jarvistradutorbackend.dto.*;
+import com.dnobretech.jarvistradutorbackend.client.QeClient;
+import com.dnobretech.jarvistradutorbackend.dto.AlignedPair;
+import com.dnobretech.jarvistradutorbackend.dto.Block;
+import com.dnobretech.jarvistradutorbackend.dto.ExamplePair;
+import com.dnobretech.jarvistradutorbackend.dto.Result;
 import com.dnobretech.jarvistradutorbackend.epubimport.*;
 import com.dnobretech.jarvistradutorbackend.service.EPUBPairImportService;
 import com.dnobretech.jarvistradutorbackend.util.TextNormalizer;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.postgresql.copy.CopyManager;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -47,9 +50,23 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
     private final Aligner lengthAligner;
     private final Aligner embeddingAlignerHungarian;
 
+    private final QeClient qeClient;
+
+    @Value("${jarvis.scoring.good-min:0.80}")
+    private double goodMin;
+
+    @Value("${jarvis.scoring.suspect-min:0.55}")
+    private double suspectMin;
+
+    @Value("${jarvis.scoring.qe-good-min:0.75}")
+    private double qeGoodMin;
+
+    @Value("${jarvis.embeddings.only-approved}")
+    private boolean embedOnlyApproved;
+
     public EPUBPairImportServiceImpl(
             DataSource dataSource, JdbcTemplate jdbc, TextNormalizer norm, EpubExtractor epubExtractor, QualityFilter qualityFilter, EmbeddingService embeddingService, InboxWriter inboxWriter, SchemaEnsurer schemaEnsurer, @Qualifier("lengthAligner") Aligner lengthAligner,
-            @Qualifier("embeddingAlignerHungarian") Aligner embeddingAlignerHungarian
+            @Qualifier("embeddingAlignerHungarian") Aligner embeddingAlignerHungarian, QeClient qeClient
             /* demais deps… */) {
         this.dataSource = dataSource;
         this.jdbc = jdbc;
@@ -61,6 +78,7 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
         this.schemaEnsurer = schemaEnsurer;
         this.lengthAligner = lengthAligner;
         this.embeddingAlignerHungarian = embeddingAlignerHungarian;
+        this.qeClient = qeClient;
     }
 
     // ===== Orquestração principal =====
@@ -85,6 +103,8 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                 ? embeddingAlignerHungarian
                 : lengthAligner;
         List<AlignedPair> aligned = aligner.align(blocksEn, blocksPt);
+        log.info("[epub-pair] alinhados (pos-Hungarian/length) = {}", aligned.size());
+
 
         // 3) COPY → STAGING (inbox) + (opcional) arquivo de embeddings
         boolean doEmb = "embedding".equalsIgnoreCase(mode);
@@ -109,56 +129,81 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
         final int BATCH = 512;
         List<String> bufSrc = new ArrayList<>(BATCH);
         List<String> bufTgt = new ArrayList<>(BATCH);
-        List<Double> bufQ  = new ArrayList<>(BATCH);
+        List<Double> bufQ = new ArrayList<>(BATCH);
+        List<PendingItem> pending = new ArrayList<>(BATCH);
 
         // Dedupe leve por (src,tgt,langs,location) dentro do lote
         Set<String> seen = new HashSet<>(aligned.size() * 2);
+
+        final IntRef skippedRef = new IntRef(0);
 
         try (InboxWriter.CopyCtx ctx = inboxWriter.openBookpairInboxStagingCopy()) {
             Writer out = ctx.writer;
 
             for (AlignedPair ap : aligned) {
-                String src = norm.normalize(ap.src());
-                String tgt = norm.normalize(ap.tgt());
-                if (src.isBlank() || tgt.isBlank()) { skipped++; continue; }
+                String src = norm.normalizeDialogue(ap.src());
+                String tgt = norm.normalizeDialogue(ap.tgt());
+                if (src.isBlank() || tgt.isBlank()) {
+                    skipped++;
+                    continue;
+                }
 
                 // posição do SRC (usaremos para chapter/location)
-                String chapter  = ap.srcPos().chapterTitle();
+                String chapter = ap.srcPos().chapterTitle();
                 String location = posToLocation(ap.srcPos());
 
                 String key = src + "\u0001" + tgt + "\u0001" + srcLang + "\u0001" + tgtLang + "\u0001" + location;
-                if (!seen.add(key)) { skipped++; continue; }
+                if (!seen.add(key)) {
+                    skipped++;
+                    continue;
+                }
 
                 // qualidade
-                double r  = qualityFilter.lengthRatio(src, tgt);
+                double r = qualityFilter.lengthRatio(src, tgt);
                 boolean ph = qualityFilter.placeholdersPreserved(src, tgt);
-                if (r < ratioMin || r > ratioMax || !ph) { skipped++; continue; }
+                if (r < ratioMin || r > ratioMax || !ph) {
+                    skipped++;
+                    continue;
+                }
 
                 double q = qualityFilter.qualityScore(r, ph, ratioMin, ratioMax);
-                if (q < minQuality) { skipped++; continue; }
 
-                // 3.1) CSV → staging do inbox (agora inclui chapter/location)
-                writeBookpairInboxCsvLine(
-                        out,
-                        src, tgt, srcLang, tgtLang, q,
-                        seriesId, bookId,
-                        chapter, location,
-                        sourceTag
-                );
-
-                inserted++;
-                sumQ += q;
-                if (examples.size() < 10) examples.add(new ExamplePair(src, tgt, q));
-
-                // 3.2) Embeddings → arquivo temporário
-                if (doEmb) {
-                    bufSrc.add(src);
-                    bufTgt.add(tgt);
-                    bufQ.add(q);
-                    if (bufSrc.size() >= BATCH) {
-                        embeddingService.flushEmbeddingsToFile(embFileWriter, bufSrc, bufTgt, srcLang, tgtLang, bufQ, true);
-                    }
+                // NEW: sim vindo do aligner (se for LengthAligner, trate como 0.0)
+                double sim = 0.0;
+                try {
+                    sim = Math.max(0.0, Math.min(1.0, ap.sim()));
+                } catch (Throwable ignore) {
                 }
+
+                // NEW: acumula no lote para enriquecer com QE
+                pending.add(new PendingItem(src, tgt, chapter, location, q, sim));
+
+                // FLUSH por lote
+                if (pending.size() >= BATCH) {
+                    enrichWithQE(pending);
+                    int writ = flushPendingToStaging(
+                            out, pending, srcLang, tgtLang, seriesId, bookId, sourceTag, minQuality,
+                            examples, skippedRef,
+                            doEmb, bufSrc, bufTgt, bufQ
+                    );
+                    inserted += writ;
+                    for (var it : pending) sumQ += it.qRule;
+                    pending.clear();
+                }
+
+
+            }
+
+            if (!pending.isEmpty()) {
+                enrichWithQE(pending);
+                int writ = flushPendingToStaging(
+                        out, pending, srcLang, tgtLang, seriesId, bookId, sourceTag, minQuality,
+                        examples, skippedRef,
+                        doEmb, bufSrc, bufTgt, bufQ
+                );
+                inserted += writ;
+                for (var it : pending) sumQ += it.qRule;
+                pending.clear();
             }
 
             if (doEmb && !bufSrc.isEmpty()) {
@@ -166,9 +211,17 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
             }
         } finally {
             if (embFileWriter != null) {
-                try { embFileWriter.close(); } catch (IOException ignore) {}
+                try {
+                    embFileWriter.close();
+                } catch (IOException ignore) {
+                }
             }
         }
+
+        log.info("[epub-pair] após filtros baratos (ratio/placeholders) = {}", inserted + skipped); // ou faça um contador dedicado
+        log.info("[epub-pair] gravados no staging (linhas CSV) = {}", inserted);
+        log.info("[epub-pair] rejeitados nos filtros baratos = {}", skipped);
+
 
         // 4) Consolidar STAGING → INBOX (UPSERT seguro)
         int merged = inboxWriter.mergeBookpairInboxFromStaging(jdbc);
@@ -182,9 +235,9 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                         new InputStreamReader(new FileInputStream(embTmpFile), StandardCharsets.UTF_8),
                         1 << 20)) {
                     cm2.copyIn("""
-                    COPY tm_bookpair_emb_staging(src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality)
-                    FROM STDIN WITH (FORMAT csv, HEADER true)
-                """, r);
+                                COPY tm_bookpair_emb_staging(src,tgt,lang_src,lang_tgt,emb_src,emb_tgt,quality)
+                                FROM STDIN WITH (FORMAT csv, HEADER true)
+                            """, r);
                 }
             } finally {
                 if (!embTmpFile.delete()) {
@@ -196,15 +249,16 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
         // 6) Marca o livro como “pares importados”
         if (bookId != null && merged > 0) {
             int upd = jdbc.update("""
-            UPDATE book
-               SET pairs_imported = TRUE,
-                   updated_at     = now()
-             WHERE id = ?
-        """, bookId);
+                        UPDATE book
+                           SET pairs_imported = TRUE,
+                               updated_at     = now()
+                         WHERE id = ?
+                    """, bookId);
             log.info("[epub-pair] book {} marcado como pairs_imported=TRUE (upd={})", bookId, upd);
         }
 
         double avgQ = inserted > 0 ? (sumQ / inserted) : 0.0;
+        skipped += skippedRef.v;
         return new Result(inserted, skipped, avgQ, chapters, examples);
     }
 
@@ -222,7 +276,10 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
             Double quality,
             Long seriesId, Long bookId,
             String chapter, String location,
-            String sourceTag
+            String sourceTag,
+            Double qeScore,     // NEW
+            Double btChrf,      // NEW (0..100, pode ser null)
+            Double finalScore   // NEW 0..1
     ) throws IOException {
         w.write('"');
         w.write(esc(src));
@@ -263,6 +320,12 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
             w.write(esc(sourceTag));
             w.write('"');
         }
+        w.write(',');
+        if (qeScore != null) w.write(Double.toString(qeScore));
+        w.write(',');
+        if (btChrf != null) w.write(Double.toString(btChrf));
+        w.write(',');
+        if (finalScore != null) w.write(Double.toString(finalScore));
         w.write('\n');
     }
 
@@ -286,5 +349,138 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                 """);
     }
 
+    private static class PendingItem {
+        private final String src, tgt, chapter, location;
+        private final double qRule; // qualityFilter.qualityScore (0..1)
+        private final double sim;   // 0..1 (se não tiver, 0)
+        private Double qeScore;     // raw (vamos normalizar pra 0..1 se necessário)
+        private Double finalScore;  // 0..1
+
+        PendingItem(String src, String tgt, String chapter, String location, double qRule, double sim) {
+            this.src = src;
+            this.tgt = tgt;
+            this.chapter = chapter;
+            this.location = location;
+            this.qRule = qRule;
+            this.sim = sim;
+        }
+    }
+
+    // === (5.2) Lógica de composição de score ===
+    private static double computeFinalScore(double sim01, double qRule01, double qe01 /*, Double bt01 opcional */) {
+        // pesos iniciais:
+        double sim = clamp01(sim01);
+        double q = clamp01(qRule01);
+        double qe = clamp01(qe01);
+        // sem BT por enquanto: 0.45*sim + 0.35*qe + 0.20*q
+        return 0.45 * sim + 0.35 * qe + 0.20 * q;
+    }
+
+    private static double clamp01(double v) {
+        return Math.max(0.0, Math.min(1.0, v));
+    }
+
+    // converte QE bruto para 0..1 quando necessário
+    private static double normalizeQeTo01(Double qeRaw) {
+        if (qeRaw == null) return 0.0;
+        double x = qeRaw;
+        // muitos checkpoints já devolvem ~0..1. Quando vier ~[-1,1], normaliza:
+        if (x < 0.0 && x >= -1.0) return (x + 1.0) / 2.0;
+        if (x > 1.0 && x <= 2.0) return Math.max(0.0, Math.min(1.0, x / 2.0));
+        return clamp01(x);
+    }
+
+    // === Enriquecimento com QE (chama /qe em lote) ===
+    private void enrichWithQE(List<PendingItem> items) {
+        if (items.isEmpty()) return;
+        var req = new ArrayList<QeClient.QEItem>(items.size());
+        for (var it : items) {
+            var qi = new QeClient.QEItem();
+            qi.setSrc(it.src);
+            qi.setMt(it.tgt); // QE ref-free usa 'mt' (hipótese)
+            req.add(qi);
+        }
+        var scores = qeClient.scoreBatch(req);
+        for (int i = 0; i < items.size(); i++) {
+            var it = items.get(i);
+            Double qeRaw = (i < scores.size() ? scores.get(i) : null);
+            it.qeScore = qeRaw;
+
+            double qe01 = normalizeQeTo01(qeRaw);
+            it.finalScore = computeFinalScore(it.sim, it.qRule, qe01);
+        }
+    }
+
+    // === (5.3) Flush do lote para o CSV do staging ===
+    // --- UPDATED SIGNATURE:
+    // escreve TODO o lote no STAGING; decide embeddings via flag embedOnlyApproved
+    private int flushPendingToStaging(
+            Writer out,
+            List<PendingItem> items,
+            String srcLang, String tgtLang,
+            Long seriesId, Long bookId,
+            String sourceTag,
+            double minQualityGate,                 // (não usado mais; mantido por compat)
+            List<ExamplePair> examples,
+            IntRef skippedRef,                     // (não incrementaremos aqui)
+            boolean doEmb,
+            List<String> bufSrc,
+            List<String> bufTgt,
+            List<Double> bufQ
+    ) throws IOException {
+        int written = 0;
+
+        // (opcional) detectar lote com QE indisponível (tudo null) — hoje não precisamos, pois não gateamos mais
+        // boolean qeFalhouNoLote = items.stream().allMatch(it -> it.qeScore == null);
+
+        for (var it : items) {
+            // escreve SEMPRE no staging do inbox
+            writeBookpairInboxCsvLine(
+                    out,
+                    it.src, it.tgt, srcLang, tgtLang, it.qRule,
+                    seriesId, bookId,
+                    it.chapter, it.location,
+                    sourceTag,
+                    it.qeScore,        // pode ser null
+                    null,              // bt_chrf (plugaremos depois)
+                    it.finalScore      // pode ser null
+            );
+            written++;
+
+            // exemplos (só pros primeiros 10; se quiser, filtrar por finalScore>=0.55)
+            if (examples.size() < 10) {
+                examples.add(new ExamplePair(it.src, it.tgt, it.qRule));
+            }
+
+            // Embeddings: todos os candidatos OU só os "prováveis" (finalScore>=0.55)
+            if (doEmb) {
+                boolean approvedForEmb = !embedOnlyApproved || (it.finalScore != null && it.finalScore >= 0.55);
+                if (approvedForEmb) {
+                    bufSrc.add(it.src);
+                    bufTgt.add(it.tgt);
+                    bufQ.add(it.qRule);
+                }
+            }
+        }
+        // skippedRef.v não muda aqui — "skipped" agora só conta os reprovados nos filtros baratos (ratio/placeholders)
+        return written;
+    }
+
+    // --- NEW (no mesmo arquivo ou numa classe util sua):
+    private static class IntRef {
+        int v;
+
+        IntRef(int v) {
+            this.v = v;
+        }
+    }
+
+    private String classifyStatus(Double finalScore, Double qeScore) {
+        double f = finalScore != null ? finalScore : 0.0;
+        double q = qeScore != null ? qeScore : 0.0;
+        if (f >= goodMin && q >= qeGoodMin) return "good";
+        if (f >= suspectMin) return "suspect";
+        return "bad";
+    }
 
 }

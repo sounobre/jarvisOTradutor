@@ -5,11 +5,13 @@ import com.dnobretech.jarvistradutorbackend.dto.AlignedPair;
 import com.dnobretech.jarvistradutorbackend.dto.Block;
 import com.dnobretech.jarvistradutorbackend.dto.Pair;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.List;
 
+@Slf4j
 @Component
 @RequiredArgsConstructor
 public class EmbeddingAligner implements Aligner {
@@ -38,10 +40,13 @@ public class EmbeddingAligner implements Aligner {
                 }
                 if (bestJ>=0) {
                     Block sb = sBatch.get(a), tb = tgt.get(bestJ);
-                    out.add(new AlignedPair(sb.text(), sb, tb.text(), tb));
+                    out.add(new AlignedPair(sb.text(), sb, tb.text(), tb, 0.0));
                 }
             }
         }
+
+        log.info("Dentro de EmbeddingAligner: \n");
+
         return out;
     }
 
@@ -51,4 +56,6 @@ public class EmbeddingAligner implements Aligner {
         double d = Math.sqrt(na)*Math.sqrt(nb);
         return d==0 ? 0 : dot/d;
     }
+
+
 }

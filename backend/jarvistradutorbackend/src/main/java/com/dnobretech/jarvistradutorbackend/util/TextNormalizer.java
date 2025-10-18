@@ -18,4 +18,27 @@ public class TextNormalizer {
         t = MULTI_SPACE.matcher(t).replaceAll(" ");                         // colapsa espaços
         return t;
     }
+
+    public String normalizeDialogue(String s) {
+        if (s == null) return "";
+        String t = normalize(s); // sua normalize atual (trim + NFKC + espaços)
+
+        // ASPAS DUPLAS tipográficas -> ASCII
+        t = t.replace('“','"').replace('”','"').replace('«','"').replace('»','"');
+        // APÓSTROFOS tipográficos -> ASCII (NÃO REMOVER!)
+        t = t.replace('’','\'').replace('‘','\'');
+
+        // travessão U+2014 -> hífen (opcional, se quiser uniformizar)
+        t = t.replace('\u2014', '-');
+
+        // remover travessão/hífen líder típico de fala, mas **não** mexer em apóstrofos
+        t = t.replaceAll("^(\\-|—)\\s*", "");
+
+        // reticências: normalizar spacing
+        t = t.replaceAll("\\s*\\.\\.\\.\\s*", " ... ");
+
+        // colapsa espaços novamente
+        t = t.replaceAll("\\s+", " ").trim();
+        return t;
+    }
 }
