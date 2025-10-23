@@ -56,26 +56,30 @@ public class InboxWriter {
     }
 
     /** Abre COPY para **tm_bookpair_inbox_staging**. */
+    // --- UPDATED FILE: com/dnobretech/jarvistradutorbackend/epubimport/InboxWriter.java ---
     public CopyCtx openBookpairInboxStagingCopy() throws Exception {
-        schema.ensureBookpairSchemas(); // garante tudo antes
+        schema.ensureBookpairSchemas();
         Connection con = DataSourceUtils.getConnection(dataSource);
         BaseConnection base = con.unwrap(BaseConnection.class);
         PGCopyOutputStream pgOut = new PGCopyOutputStream(
                 base,
                 "COPY tm_bookpair_inbox_staging(" +
                         // ORDEM IMPORTANTE:
-                        "src,tgt,lang_src,lang_tgt,quality,series_id,book_id,chapter,location,source_tag,qe_score,bt_chrf,final_score" +
+                        "src,tgt,lang_src,lang_tgt,quality,series_id,book_id," +
+                        "chapter_en,chapter_pt,chapter," + // NEW cols + legado
+                        "location,source_tag,qe_score,bt_chrf,final_score" +
                         ") FROM STDIN WITH (FORMAT csv, HEADER true)"
         );
         BufferedWriter w = new BufferedWriter(new OutputStreamWriter(pgOut, StandardCharsets.UTF_8), 1 << 16);
-        // cabeçalho CSV NA MESMA ORDEM:
-        w.write("src,tgt,lang_src,lang_tgt,quality,series_id,book_id,chapter,location,source_tag,qe_score,bt_chrf,final_score\n");
+        w.write("src,tgt,lang_src,lang_tgt,quality,series_id,book_id,chapter_en,chapter_pt,chapter,location,source_tag,qe_score,bt_chrf,final_score\n");
         return new CopyCtx(w, pgOut, con, dataSource);
     }
+
 
     //MERGE!!!
     /** Consolida staging → inbox sem erro de duplicidade (requer Postgres 15+ por MERGE). */
     // com.dnobretech.jarvistradutorbackend.epubimport.InboxWriter.java
+    // --- UPDATED FILE: com/dnobretech/jarvistradutorbackend/epubimport/InboxWriter.java ---
     public int mergeBookpairInboxFromStaging(JdbcTemplate jdbc) {
         jdbc.execute("""
         CREATE TEMP TABLE IF NOT EXISTS _bp_dedup AS
@@ -83,7 +87,9 @@ public class InboxWriter {
             src,tgt,lang_src,lang_tgt,
             COALESCE(series_id,0),COALESCE(book_id,0),COALESCE(source_tag,'')
         )
-            src,tgt,lang_src,lang_tgt,quality,series_id,book_id,chapter,location,source_tag,
+            src,tgt,lang_src,lang_tgt,quality,series_id,book_id,
+            chapter,chapter_en,chapter_pt,          -- NEW
+            location,source_tag,
             qe_score,bt_chrf,final_score,created_at
         FROM tm_bookpair_inbox_staging
         ORDER BY
@@ -92,10 +98,9 @@ public class InboxWriter {
             quality DESC, created_at DESC
     """);
 
-        // leia dos @Value no service e injete aqui via construtor se preferir
-        double goodMin    = goodMinValue;    // ex.: 0.80
-        double suspectMin = suspectMinValue; // ex.: 0.55
-        double qeGoodMin  = qeGoodMinValue;  // ex.: 0.75
+        double goodMin    = goodMinValue;
+        double suspectMin = suspectMinValue;
+        double qeGoodMin  = qeGoodMinValue;
 
         String sql = """
         MERGE INTO tm_bookpair_inbox t
@@ -110,10 +115,14 @@ public class InboxWriter {
              COALESCE(t.source_tag,'') = COALESCE(s.source_tag,'')
            )
         WHEN NOT MATCHED THEN INSERT
-          (src,tgt,lang_src,lang_tgt,quality,series_id,book_id,chapter,location,source_tag,
+          (src,tgt,lang_src,lang_tgt,quality,series_id,book_id,
+           chapter_en,chapter_pt,chapter,     -- NEW + legado
+           location,source_tag,
            status,created_at,qe_score,bt_chrf,final_score)
           VALUES
-          (s.src,s.tgt,s.lang_src,s.lang_tgt,s.quality,s.series_id,s.book_id,s.chapter,s.location,s.source_tag,
+          (s.src,s.tgt,s.lang_src,s.lang_tgt,s.quality,s.series_id,s.book_id,
+           s.chapter_en, s.chapter_pt, COALESCE(s.chapter, s.chapter_en),
+           s.location,s.source_tag,
            CASE
              WHEN COALESCE(s.final_score,0) >= ? AND COALESCE(s.qe_score,0) >= ? THEN 'good'
              WHEN COALESCE(s.final_score,0) >= ? THEN 'suspect'
@@ -125,6 +134,11 @@ public class InboxWriter {
           qe_score    = COALESCE(s.qe_score, t.qe_score),
           bt_chrf     = COALESCE(s.bt_chrf,  t.bt_chrf),
           final_score = COALESCE(s.final_score, t.final_score),
+          -- Preencher capítulos novos se ainda faltam (não rebaixa valores existentes)
+          chapter_en  = COALESCE(t.chapter_en, s.chapter_en),
+          chapter_pt  = COALESCE(t.chapter_pt, s.chapter_pt),
+          -- manter 'chapter' legado coerente (se vazio, usar EN)
+          chapter     = COALESCE(t.chapter, COALESCE(s.chapter, s.chapter_en)),
           status = CASE
                      WHEN t.status = 'good' THEN 'good'
                      WHEN COALESCE(s.final_score,0) >= ? AND COALESCE(s.qe_score,0) >= ? THEN 'good'
@@ -146,6 +160,7 @@ public class InboxWriter {
         jdbc.execute("DROP TABLE IF EXISTS _bp_dedup");
         return affected;
     }
+
 
 
 

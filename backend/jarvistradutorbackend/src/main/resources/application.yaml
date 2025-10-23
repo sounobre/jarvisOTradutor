@@ -21,7 +21,7 @@ spring:
   # JPA/Hibernate
   jpa:
     hibernate:
-      ddl-auto: create
+      ddl-auto: update
     open-in-view: false
     show-sql: false
     properties:
@@ -53,9 +53,9 @@ jarvis:
     ratio-min: 0.5                                       # filtros de qualidade para import
     ratio-max: 2.0
   qe:
-    timeout-seconds: 90
+    timeout-seconds: 9000
   bt:
-    timeout-seconds: 120
+    timeout-seconds: 1200
   aligner:
     mode: embedding      # default
     window-size: 10
@@ -63,8 +63,13 @@ jarvis:
     good-min: 0.80          # final_score ≥ 0.80 ⇒ good (se QE bom)
     suspect-min: 0.55            # final_score ≥ 0.55 ⇒ pelo menos suspect/pending
     qe-good-min: 0.75             # qe_score ≥ 0.75 para chamar de good
-
   glossary:
     embed-mode: both        # none|src|both
+  reviewer:
+    base-url: http://localhost:8010
+    timeout-seconds: 120
+  translate:
+    base-url: http://127.0.0.1:8010
+    timeout-seconds: 60
 
 

@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 @RestController
 @RequestMapping("/tm/review")
@@ -51,5 +52,14 @@ public class ReviewController {
     public ResponseEntity<?> commitBookpairs() {
         int n = review.commitBookpairsApproved();
         return ResponseEntity.ok(java.util.Map.of("ok", true, "affected", n));
+    }
+
+    @PostMapping
+    public Map<String,Object> run(
+            @RequestParam(name="max", defaultValue="0.41") double max,
+            @RequestParam(name="limit", defaultValue="10") int limit
+    ) {
+        int n = review.reviewPairs(max, limit);
+        return Map.of("updated", n, "max", max, "limit", limit);
     }
 }

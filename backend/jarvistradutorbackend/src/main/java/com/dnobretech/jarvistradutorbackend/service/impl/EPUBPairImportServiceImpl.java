@@ -149,8 +149,11 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                 }
 
                 // posição do SRC (usaremos para chapter/location)
+
                 String chapter = ap.srcPos().chapterTitle();
-                String location = posToLocation(ap.srcPos());
+                String chapterEn = ap.srcPos()!=null ? ap.srcPos().chapterTitle() : null;
+                String chapterPt = ap.tgtPos()!=null ? ap.tgtPos().chapterTitle() : null;
+                String location  = posToLocation(ap.srcPos()); // mantemos localização do EN
 
                 String key = src + "\u0001" + tgt + "\u0001" + srcLang + "\u0001" + tgtLang + "\u0001" + location;
                 if (!seen.add(key)) {
@@ -176,7 +179,7 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                 }
 
                 // NEW: acumula no lote para enriquecer com QE
-                pending.add(new PendingItem(src, tgt, chapter, location, q, sim));
+                pending.add(new PendingItem(src, tgt, chapterEn, chapterPt, location, q, sim));
 
                 // FLUSH por lote
                 if (pending.size() >= BATCH) {
@@ -269,17 +272,21 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
 
 
     // ===== Helpers de IO CSV (escrita de uma linha do inbox staging) =====
+    // --- UPDATED FILE: com/dnobretech/jarvistradutorbackend/service/impl/EPUBPairImportServiceImpl.java ---
+// altera a assinatura para receber chapter_en e chapter_pt:
     private static void writeBookpairInboxCsvLine(
             Writer w,
             String src, String tgt,
             String langSrc, String langTgt,
             Double quality,
             Long seriesId, Long bookId,
-            String chapter, String location,
+            String chapterEn, String chapterPt, // NEW
+            String chapterLegacy,               // será chapter_en para compat
+            String location,
             String sourceTag,
-            Double qeScore,     // NEW
-            Double btChrf,      // NEW (0..100, pode ser null)
-            Double finalScore   // NEW 0..1
+            Double qeScore,
+            Double btChrf,
+            Double finalScore
     ) throws IOException {
         w.write('"');
         w.write(esc(src));
@@ -303,9 +310,21 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
         w.write(',');
         if (bookId != null) w.write(bookId.toString());
         w.write(',');
-        if (chapter != null && !chapter.isBlank()) {
+        if (chapterEn != null && !chapterEn.isBlank()) {
             w.write('"');
-            w.write(esc(chapter));
+            w.write(esc(chapterEn));
+            w.write('"');
+        }
+        w.write(',');
+        if (chapterPt != null && !chapterPt.isBlank()) {
+            w.write('"');
+            w.write(esc(chapterPt));
+            w.write('"');
+        }
+        w.write(',');
+        if (chapterLegacy != null && !chapterLegacy.isBlank()) {
+            w.write('"');
+            w.write(esc(chapterLegacy));
             w.write('"');
         }
         w.write(',');
@@ -329,6 +348,7 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
         w.write('\n');
     }
 
+
     private static String esc(String s) {
         return s.replace("\"", "\"\"");
     }
@@ -349,22 +369,24 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                 """);
     }
 
+    // --- UPDATED FILE: EPUBPairImportServiceImpl.java ---
     private static class PendingItem {
-        private final String src, tgt, chapter, location;
-        private final double qRule; // qualityFilter.qualityScore (0..1)
-        private final double sim;   // 0..1 (se não tiver, 0)
-        private Double qeScore;     // raw (vamos normalizar pra 0..1 se necessário)
-        private Double finalScore;  // 0..1
+        private final String src, tgt;
+        private final String chapterEn, chapterPt; // NEW
+        private final String location;
+        private final double qRule;
+        private final double sim;
+        private Double qeScore;
+        private Double finalScore;
 
-        PendingItem(String src, String tgt, String chapter, String location, double qRule, double sim) {
-            this.src = src;
-            this.tgt = tgt;
-            this.chapter = chapter;
+        PendingItem(String src, String tgt, String chapterEn, String chapterPt, String location, double qRule, double sim) {
+            this.src = src; this.tgt = tgt;
+            this.chapterEn = chapterEn; this.chapterPt = chapterPt; // NEW
             this.location = location;
-            this.qRule = qRule;
-            this.sim = sim;
+            this.qRule = qRule; this.sim = sim;
         }
     }
+
 
     // === (5.2) Lógica de composição de score ===
     private static double computeFinalScore(double sim01, double qRule01, double qe01 /*, Double bt01 opcional */) {
@@ -414,45 +436,44 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
     // === (5.3) Flush do lote para o CSV do staging ===
     // --- UPDATED SIGNATURE:
     // escreve TODO o lote no STAGING; decide embeddings via flag embedOnlyApproved
+    // --- UPDATED SIGNATURE (se necessário você já a alterou acima) ---
     private int flushPendingToStaging(
             Writer out,
             List<PendingItem> items,
             String srcLang, String tgtLang,
             Long seriesId, Long bookId,
             String sourceTag,
-            double minQualityGate,                 // (não usado mais; mantido por compat)
+            double minQualityGate,
             List<ExamplePair> examples,
-            IntRef skippedRef,                     // (não incrementaremos aqui)
+            IntRef skippedRef,
             boolean doEmb,
             List<String> bufSrc,
             List<String> bufTgt,
             List<Double> bufQ
     ) throws IOException {
+
         int written = 0;
-
-        // (opcional) detectar lote com QE indisponível (tudo null) — hoje não precisamos, pois não gateamos mais
-        // boolean qeFalhouNoLote = items.stream().allMatch(it -> it.qeScore == null);
-
         for (var it : items) {
-            // escreve SEMPRE no staging do inbox
+            // preenche 'chapter' legado com chapter_en para compat
+            String legacyChapter = it.chapterEn;
+
             writeBookpairInboxCsvLine(
                     out,
                     it.src, it.tgt, srcLang, tgtLang, it.qRule,
                     seriesId, bookId,
-                    it.chapter, it.location,
+                    it.chapterEn, it.chapterPt, legacyChapter,  // NEW trio
+                    it.location,
                     sourceTag,
-                    it.qeScore,        // pode ser null
-                    null,              // bt_chrf (plugaremos depois)
-                    it.finalScore      // pode ser null
+                    it.qeScore,
+                    null,
+                    it.finalScore
             );
             written++;
 
-            // exemplos (só pros primeiros 10; se quiser, filtrar por finalScore>=0.55)
             if (examples.size() < 10) {
                 examples.add(new ExamplePair(it.src, it.tgt, it.qRule));
             }
 
-            // Embeddings: todos os candidatos OU só os "prováveis" (finalScore>=0.55)
             if (doEmb) {
                 boolean approvedForEmb = !embedOnlyApproved || (it.finalScore != null && it.finalScore >= 0.55);
                 if (approvedForEmb) {
@@ -462,9 +483,9 @@ public class EPUBPairImportServiceImpl implements EPUBPairImportService {
                 }
             }
         }
-        // skippedRef.v não muda aqui — "skipped" agora só conta os reprovados nos filtros baratos (ratio/placeholders)
         return written;
     }
+
 
     // --- NEW (no mesmo arquivo ou numa classe util sua):
     private static class IntRef {
